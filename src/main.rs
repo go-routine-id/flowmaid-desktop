@@ -834,3 +834,69 @@ fn dashed_bezier(p: &egui::Painter, b: [Pos2; 4], stroke: Stroke) {
         prev = cur;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(CONTOH.to_string(), None, Vec::new())
+    }
+
+    #[test]
+    fn zoom_around_keeps_the_anchored_world_point_fixed() {
+        let mut a = app();
+        a.pan = Vec2::new(40.0, -20.0);
+        let anchor = Vec2::new(300.0, 200.0);
+        let world_before = (anchor - a.pan) / a.zoom;
+        a.zoom_around(1.5, anchor);
+        let world_after = (anchor - a.pan) / a.zoom;
+        assert!((world_before - world_after).length() < 1e-3);
+        assert!((a.zoom - 1.5).abs() < 1e-6);
+        // Clamped at both ends.
+        a.zoom_around(100.0, anchor);
+        assert!(a.zoom <= MAX_ZOOM);
+        a.zoom_around(1e-6, anchor);
+        assert!(a.zoom >= MIN_ZOOM);
+    }
+
+    #[test]
+    fn recent_files_dedupe_and_cap_at_eight() {
+        let mut a = app();
+        for i in 0..12 {
+            a.push_recent(Path::new(&format!("/tmp/f{}.mmd", i % 10)));
+        }
+        assert!(a.recent.len() <= 8);
+        // Re-opening an old file moves it to the front, no duplicate.
+        a.push_recent(Path::new("/tmp/f5.mmd"));
+        assert_eq!(a.recent[0], "/tmp/f5.mmd");
+        assert_eq!(a.recent.iter().filter(|r| *r == "/tmp/f5.mmd").count(), 1);
+    }
+
+    #[test]
+    fn dirty_tracks_divergence_from_saved_source() {
+        let mut a = app();
+        assert!(!a.dirty(), "fresh document starts clean");
+        a.src.push_str("\nX --> Y\n");
+        assert!(a.dirty());
+        a.saved_src = a.src.clone();
+        assert!(!a.dirty());
+    }
+
+    #[test]
+    fn reparse_switches_between_flowchart_and_er_models() {
+        let mut a = app();
+        assert!(a.tables.is_empty(), "sample document is a flowchart");
+        a.src = "erDiagram\nusers ||--o{ posts : writes".into();
+        a.reparse();
+        assert!(matches!(a.model, Model::Er(_)));
+        assert_eq!(a.tables.len(), 2);
+        assert_eq!(a.cards.len(), 1);
+        // Positions preserved by key across an edit.
+        let before = a.pos[0];
+        a.pos[0] = (before.0 + 300.0, before.1);
+        a.src = "erDiagram\nusers ||--o{ posts : writes\nposts }o--|| tags : has".into();
+        a.reparse();
+        assert_eq!(a.pos[0], (before.0 + 300.0, before.1), "users keeps its dragged spot");
+    }
+}

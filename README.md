@@ -1,5 +1,6 @@
 # flowmaid-desktop
 
+[![CI](https://github.com/go-routine-id/flowmaid-desktop/actions/workflows/ci.yml/badge.svg)](https://github.com/go-routine-id/flowmaid-desktop/actions/workflows/ci.yml)
 Interactive desktop diagram editor built on the [flowmaid](https://crates.io/crates/flowmaid) engine (eframe/egui, pure Rust).
 
 ## Features
