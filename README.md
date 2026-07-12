@@ -8,8 +8,8 @@ Interactive desktop diagram editor built on the [flowmaid](https://crates.io/cra
 - **Drag nodes with the mouse** — edges re-route in realtime via `flowmaid::scene::route`.
 - **ER diagrams** — entities render as attribute tables with crow's foot cardinality notation (`flowmaid::er`), draggable like everything else.
 - **Zoom & pan** — pinch / ctrl+scroll / ± buttons to zoom (anchored at the cursor), scroll or drag empty canvas to pan; click the percentage button to reset.
-- **Open files** by dropping a `.mmd` onto the window or passing a path on the command line.
-- **Auto re-layout** restores the engine layout; **Export SVG** saves the current arrangement, drags included.
+- **Real file workflow** — File menu with New / Open… / recent files / Save / Save As… (⌘N ⌘O ⌘S ⇧⌘S), a dirty indicator in the window title, and a save-first confirmation before anything discards unsaved changes. Files also open via drag & drop or a command-line path.
+- **Auto re-layout** restores the engine layout; **Export SVG…** saves the current arrangement, drags included.
 
 ## Running
 

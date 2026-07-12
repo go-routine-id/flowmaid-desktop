@@ -17,6 +17,7 @@ use flowmaid::model::{Card, EdgeKind, ErDiagram, Graph, Shape};
 use flowmaid::scene::{route, scene, to_svg, Scene, SceneNode};
 use flowmaid::Document;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 const EDGE: Color32 = Color32::from_rgb(0x44, 0x50, 0x7a);
 const FILL: Color32 = Color32::from_rgb(0xee, 0xf1, 0xfb);
@@ -31,10 +32,14 @@ const MAX_ZOOM: f32 = 4.0;
 const CONTOH: &str = "%% Geser node dengan mouse, atau edit teks ini.\nflowchart TD\n    A([Mulai]) --> B[Baca input]\n    B --> C{Valid?}\n    C -->|ya| D[Proses data]\n    C -->|tidak| E[Tampilkan error]\n    E --> B\n    D ==> F((Selesai))\n";
 
 fn main() -> eframe::Result<()> {
-    let src = std::env::args()
-        .nth(1)
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_else(|| CONTOH.to_string());
+    let arg = std::env::args().nth(1).map(PathBuf::from);
+    let (src, path) = match arg {
+        Some(p) => match std::fs::read_to_string(&p) {
+            Ok(t) => (t, Some(p)),
+            Err(_) => (CONTOH.to_string(), None),
+        },
+        None => (CONTOH.to_string(), None),
+    };
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1150.0, 720.0]),
         ..Default::default()
@@ -42,8 +47,23 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "flowmaid desktop",
         opts,
-        Box::new(|_cc| Ok(Box::new(App::new(src)))),
+        Box::new(move |cc| {
+            let recent: Vec<String> = cc
+                .storage
+                .and_then(|s| s.get_string("recent"))
+                .map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+                .unwrap_or_default();
+            Ok(Box::new(App::new(src, path, recent)))
+        }),
     )
+}
+
+/// Aksi yang bisa membuang perubahan; ditunda ke dialog konfirmasi
+/// bila dokumen sedang dirty.
+enum Pending {
+    New,
+    OpenDialog,
+    OpenPath(PathBuf),
 }
 
 /// Dokumen valid terakhir — flowchart atau diagram ER.
@@ -65,6 +85,11 @@ impl Model {
 
 struct App {
     src: String,
+    path: Option<PathBuf>, // file yang sedang dibuka (None = belum disimpan)
+    saved_src: String,     // isi terakhir yang tersimpan, untuk deteksi dirty
+    recent: Vec<String>,   // file terakhir dibuka, terbaru di depan
+    pending: Option<Pending>, // aksi menunggu konfirmasi buang-perubahan
+    last_title: String,
     model: Model, // dokumen valid terakhir
     pos: Vec<(f64, f64)>,        // posisi node/entitas, milik aplikasi (bisa digeser)
     scn: Scene,                  // geometri terkini untuk digambar
@@ -78,9 +103,15 @@ struct App {
 }
 
 impl App {
-    fn new(src: String) -> Self {
+    fn new(src: String, path: Option<PathBuf>, recent: Vec<String>) -> Self {
+        let saved_src = src.clone();
         let mut app = App {
             src,
+            path,
+            saved_src,
+            recent,
+            pending: None,
+            last_title: String::new(),
             model: Model::Flow(Graph::default()),
             pos: Vec::new(),
             scn: Scene {
@@ -207,25 +238,248 @@ impl App {
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
     }
+
+    fn dirty(&self) -> bool {
+        self.src != self.saved_src
+    }
+
+    fn push_recent(&mut self, p: &Path) {
+        let s = p.display().to_string();
+        self.recent.retain(|r| r != &s);
+        self.recent.insert(0, s);
+        self.recent.truncate(8);
+    }
+
+    fn open_path(&mut self, p: PathBuf) {
+        match std::fs::read_to_string(&p) {
+            Ok(t) => {
+                self.src = t;
+                self.saved_src = self.src.clone();
+                self.reparse();
+                self.reset_view();
+                self.status = format!("dibuka: {}", p.display());
+                self.push_recent(&p);
+                self.path = Some(p);
+            }
+            Err(e) => self.status = format!("gagal membuka: {}", e),
+        }
+    }
+
+    fn new_file(&mut self) {
+        self.src = CONTOH.to_string();
+        self.saved_src = self.src.clone();
+        self.path = None;
+        self.reparse();
+        self.reset_view();
+        self.status = "dokumen baru".into();
+    }
+
+    /// Simpan ke file saat ini; belum punya file → Simpan Sebagai.
+    fn save_doc(&mut self) {
+        match self.path.clone() {
+            Some(p) => self.write_to(&p),
+            None => self.save_as(),
+        }
+    }
+
+    fn save_as(&mut self) {
+        let mut dlg = rfd::FileDialog::new().add_filter("Mermaid", &["mmd"]);
+        match &self.path {
+            Some(p) => {
+                if let Some(dir) = p.parent() {
+                    dlg = dlg.set_directory(dir);
+                }
+                if let Some(n) = p.file_name() {
+                    dlg = dlg.set_file_name(n.to_string_lossy());
+                }
+            }
+            None => dlg = dlg.set_file_name("diagram.mmd"),
+        }
+        if let Some(p) = dlg.save_file() {
+            self.write_to(&p);
+            self.push_recent(&p);
+            self.path = Some(p);
+        }
+    }
+
+    fn write_to(&mut self, p: &Path) {
+        match std::fs::write(p, &self.src) {
+            Ok(_) => {
+                self.saved_src = self.src.clone();
+                self.status = format!("tersimpan: {}", p.display());
+            }
+            Err(e) => self.status = format!("gagal menyimpan: {}", e),
+        }
+    }
+
+    fn export_svg_file(&mut self) {
+        let name = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| format!("{}.svg", s.to_string_lossy()))
+            .unwrap_or_else(|| "diagram.svg".into());
+        if let Some(p) = rfd::FileDialog::new()
+            .add_filter("SVG", &["svg"])
+            .set_file_name(name)
+            .save_file()
+        {
+            match std::fs::write(&p, self.export_svg()) {
+                Ok(_) => self.status = format!("tersimpan: {}", p.display()),
+                Err(e) => self.status = format!("gagal menyimpan: {}", e),
+            }
+        }
+    }
+
+    /// Jalankan aksi yang bisa membuang perubahan; kalau dokumen
+    /// dirty, tahan dulu di dialog konfirmasi.
+    fn request(&mut self, act: Pending) {
+        if self.dirty() {
+            self.pending = Some(act);
+        } else {
+            self.perform(act);
+        }
+    }
+
+    fn perform(&mut self, act: Pending) {
+        match act {
+            Pending::New => self.new_file(),
+            Pending::OpenDialog => {
+                let mut dlg = rfd::FileDialog::new().add_filter("Mermaid", &["mmd", "txt"]);
+                if let Some(dir) = self.path.as_ref().and_then(|p| p.parent()) {
+                    dlg = dlg.set_directory(dir);
+                }
+                if let Some(p) = dlg.pick_file() {
+                    self.open_path(p);
+                }
+            }
+            Pending::OpenPath(p) => self.open_path(p),
+        }
+    }
 }
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string("recent", self.recent.join("\n"));
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Judul jendela: "• nama.mmd — flowmaid desktop" saat dirty.
+        let title = format!(
+            "{}{} — flowmaid desktop",
+            if self.dirty() { "• " } else { "" },
+            self.path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "tanpa judul".into())
+        );
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
+        }
+
+        // Shortcut file. Simpan-Sebagai dicek sebelum Simpan supaya
+        // ⇧⌘S tidak termakan ⌘S.
+        use egui::{Key, KeyboardShortcut, Modifiers};
+        const SAVE_AS: KeyboardShortcut =
+            KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S);
+        const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
+        const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
+        const NEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
+        if ctx.input_mut(|i| i.consume_shortcut(&SAVE_AS)) {
+            self.save_as();
+        } else if ctx.input_mut(|i| i.consume_shortcut(&SAVE)) {
+            self.save_doc();
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&OPEN)) {
+            self.request(Pending::OpenDialog);
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&NEW)) {
+            self.request(Pending::New);
+        }
+
         // Drag & drop FILE .mmd ke jendela.
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        if let Some(f) = dropped.first() {
-            if let Some(p) = &f.path {
-                match std::fs::read_to_string(p) {
-                    Ok(t) => {
-                        self.src = t;
-                        self.reparse();
-                        self.reset_view();
-                        self.status = format!("dibuka: {}", p.display());
-                    }
-                    Err(e) => self.status = format!("gagal membuka: {}", e),
-                }
+        if let Some(p) = dropped.first().and_then(|f| f.path.clone()) {
+            self.request(Pending::OpenPath(p));
+        }
+
+        // Dialog konfirmasi untuk aksi yang membuang perubahan.
+        if self.pending.is_some() {
+            let mut decided: Option<Option<Pending>> = None;
+            egui::Window::new("Perubahan belum disimpan")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Dokumen ini punya perubahan yang belum disimpan.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Simpan dulu").clicked() {
+                            self.save_doc();
+                            // Simpan bisa dibatalkan dari dialog Simpan
+                            // Sebagai — lanjut hanya bila benar tersimpan.
+                            decided = if self.dirty() {
+                                Some(None)
+                            } else {
+                                Some(self.pending.take())
+                            };
+                        }
+                        if ui.button("Buang perubahan").clicked() {
+                            decided = Some(self.pending.take());
+                        }
+                        if ui.button("Batal").clicked() {
+                            decided = Some(None);
+                        }
+                    });
+                });
+            match decided {
+                Some(Some(act)) => self.perform(act),
+                Some(None) => self.pending = None,
+                None => {}
             }
         }
+
+        // Menu bar.
+        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Baru        ⌘N").clicked() {
+                        self.request(Pending::New);
+                        ui.close_menu();
+                    }
+                    if ui.button("Buka…       ⌘O").clicked() {
+                        self.request(Pending::OpenDialog);
+                        ui.close_menu();
+                    }
+                    ui.add_enabled_ui(!self.recent.is_empty(), |ui| {
+                        ui.menu_button("Baru dibuka", |ui| {
+                            for r in self.recent.clone() {
+                                if ui.button(&r).clicked() {
+                                    self.request(Pending::OpenPath(PathBuf::from(&r)));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    });
+                    ui.separator();
+                    if ui.button("Simpan      ⌘S").clicked() {
+                        self.save_doc();
+                        ui.close_menu();
+                    }
+                    if ui.button("Simpan Sebagai… ⇧⌘S").clicked() {
+                        self.save_as();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Ekspor SVG…").clicked() {
+                        self.export_svg_file();
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
 
         egui::SidePanel::left("editor")
             .default_width(330.0)
@@ -237,10 +491,7 @@ impl eframe::App for App {
                         self.autolayout();
                     }
                     if ui.button("Ekspor SVG").clicked() {
-                        match std::fs::write("flowmaid-export.svg", self.export_svg()) {
-                            Ok(_) => self.status = "tersimpan: flowmaid-export.svg".into(),
-                            Err(e) => self.status = format!("gagal menyimpan: {}", e),
-                        }
+                        self.export_svg_file();
                     }
                 });
                 ui.horizontal(|ui| {
