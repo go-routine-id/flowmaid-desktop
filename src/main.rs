@@ -7,7 +7,9 @@
 //!     - Split  : kanvas + editor teks berdampingan (default)
 //!     - Code   : editor teks Mermaid penuh, pola "last good render"
 //! - Mendukung flowchart, erDiagram (tabel entitas + crow's foot),
-//!   dan classDiagram (box tiga kompartemen + glyph relasi UML)
+//!   classDiagram (box tiga kompartemen + glyph relasi UML), pie
+//!   (sektor + legenda), dan sequenceDiagram (lifeline, pesan,
+//!   activation, frame) — dua terakhir statis (tanpa geser)
 //! - Drag & drop file .mmd ke jendela untuk membukanya; Ekspor SVG
 //!
 //! Jalankan: `cargo run --release` (engine `flowmaid` ditarik
@@ -16,8 +18,12 @@
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use flowmaid::class::{self, ClassBox, RelStyle};
 use flowmaid::er::{self, ErTable};
-use flowmaid::model::{Card, ClassDiagram, EdgeKind, ErDiagram, Graph, Shape};
+use flowmaid::model::{
+    Card, ClassDiagram, EdgeKind, ErDiagram, Graph, PieChart, SequenceDiagram, Shape,
+};
+use flowmaid::pie::{self, PieScene};
 use flowmaid::scene::{route, scene, to_svg, Scene, SceneNode};
+use flowmaid::seq::{self, SeqScene};
 use flowmaid::Document;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -133,21 +139,26 @@ enum View {
     Code,
 }
 
-/// Dokumen valid terakhir — flowchart, diagram ER, atau class.
+/// Dokumen valid terakhir. Flow/ER/class punya node yang bisa
+/// digeser; pie & sequence statis (digambar apa adanya).
 enum Model {
     Flow(Graph),
     Er(ErDiagram),
     Class(ClassDiagram),
+    Pie(PieChart),
+    Sequence(SequenceDiagram),
 }
 
 impl Model {
     /// Kunci identitas node/entitas/class ke-i, untuk mempertahankan
-    /// posisi geseran saat teks diedit.
+    /// posisi geseran saat teks diedit. Pie/sequence tak punya node
+    /// yang bisa digeser, jadi kosong.
     fn keys(&self) -> Vec<&str> {
         match self {
             Model::Flow(g) => g.nodes.iter().map(|n| n.id.as_str()).collect(),
             Model::Er(d) => d.entities.iter().map(|e| e.name.as_str()).collect(),
             Model::Class(d) => d.classes.iter().map(|c| c.name.as_str()).collect(),
+            Model::Pie(_) | Model::Sequence(_) => Vec::new(),
         }
     }
 }
@@ -172,6 +183,8 @@ struct App {
     cards: Vec<(Card, Card)>, // kardinalitas per relasi ER, sejajar scn.edges
     boxes: Vec<ClassBox>,     // data box class (kosong untuk non-class)
     rels: Vec<RelStyle>,      // gaya/kardinalitas relasi class, sejajar scn.edges
+    pie: Option<PieScene>,    // geometri pie (Some hanya untuk Model::Pie)
+    seq: Option<SeqScene>,    // geometri sequence (Some hanya untuk Model::Sequence)
     error: Option<String>,
     status: String,
     zoom: f32,         // faktor zoom kanvas (1.0 = 100%)
@@ -210,6 +223,8 @@ impl App {
             cards: Vec::new(),
             boxes: Vec::new(),
             rels: Vec::new(),
+            pie: None,
+            seq: None,
             error: None,
             status: "geser node dengan mouse".into(),
             zoom: 1.0,
@@ -273,6 +288,15 @@ impl App {
                             .collect();
                         self.model = Model::Class(d);
                     }
+                    // Pie & sequence are static — no per-node positions.
+                    Document::Pie(d) => {
+                        self.pos = Vec::new();
+                        self.model = Model::Pie(d);
+                    }
+                    Document::Sequence(d) => {
+                        self.pos = Vec::new();
+                        self.model = Model::Sequence(d);
+                    }
                 }
                 self.reroute();
                 self.error = None;
@@ -297,6 +321,9 @@ impl App {
                 self.boxes = cs.boxes;
                 self.rels = cs.rels;
             }
+            // Static: recompute the scene; nothing to route.
+            Model::Pie(d) => self.set_static_pie(pie::scene(d)),
+            Model::Sequence(d) => self.set_static_seq(seq::scene(d)),
         }
     }
 
@@ -317,18 +344,34 @@ impl App {
                 self.boxes = cs.boxes;
                 self.rels = cs.rels;
             }
+            Model::Pie(d) => self.set_static_pie(pie::scene(d)),
+            Model::Sequence(d) => self.set_static_seq(seq::scene(d)),
         }
         self.pos = self.scn.nodes.iter().map(|n| (n.x, n.y)).collect();
         self.reset_view();
     }
 
-    /// Kosongkan data gambar khusus-diagram (ER & class); tiap arm
-    /// route/autolayout mengisi ulang miliknya.
+    /// Kosongkan data gambar khusus-diagram (ER, class, pie, seq);
+    /// tiap arm route/autolayout mengisi ulang miliknya.
     fn clear_aux(&mut self) {
         self.tables.clear();
         self.cards.clear();
         self.boxes.clear();
         self.rels.clear();
+        self.pie = None;
+        self.seq = None;
+    }
+
+    /// Simpan geometri pie statis; `scn` dikosongkan (tak ada node
+    /// yang bisa digeser) tapi memegang ukuran kanvas.
+    fn set_static_pie(&mut self, ps: PieScene) {
+        self.scn = blank_scene(ps.width, ps.height);
+        self.pie = Some(ps);
+    }
+
+    fn set_static_seq(&mut self, sc: SeqScene) {
+        self.scn = blank_scene(sc.width, sc.height);
+        self.seq = Some(sc);
     }
 
     /// SVG dari susunan saat ini (termasuk hasil geseran).
@@ -337,6 +380,8 @@ impl App {
             Model::Flow(_) => to_svg(&self.scn),
             Model::Er(d) => er::to_svg(&er::route(d, &self.pos)),
             Model::Class(d) => class::to_svg(&class::route(d, &self.pos)),
+            Model::Pie(d) => pie::to_svg(&pie::scene(d)),
+            Model::Sequence(d) => seq::to_svg(&seq::scene(d)),
         }
     }
 
@@ -1028,6 +1073,13 @@ impl App {
                 draw_node(painter, n, ts(n.x, n.y), zoom, hovered_node == Some(i));
             }
         }
+
+        // Static diagrams draw from their own geometry (scn is empty).
+        if let Some(ps) = &self.pie {
+            draw_pie(painter, ps, &ts, zoom);
+        } else if let Some(sq) = &self.seq {
+            draw_sequence(painter, sq, &ts, zoom);
+        }
     }
 
     /// Judul jendela dihitung di AKHIR frame — setelah semua mutasi
@@ -1356,6 +1408,262 @@ fn draw_card(
     );
 }
 
+/// Scene kosong dengan ukuran kanvas — dipakai diagram statis
+/// (pie/sequence) yang tak punya node yang bisa digeser.
+fn blank_scene(width: f64, height: f64) -> Scene {
+    Scene {
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        clusters: Vec::new(),
+        width,
+        height,
+    }
+}
+
+/// Garis putus-putus lurus (egui tak punya dash bawaan) dalam
+/// koordinat layar.
+fn dashed_line(p: &egui::Painter, a: Pos2, b: Pos2, stroke: Stroke) {
+    let len = (b - a).length();
+    let dir = (b - a) / len.max(0.001);
+    let (dash, gap) = (5.0, 4.0);
+    let mut d = 0.0;
+    while d < len {
+        let s1 = a + dir * (d + dash).min(len);
+        p.line_segment([a + dir * d, s1], stroke);
+        d += dash + gap;
+    }
+}
+
+/// Pie chart: judul, sektor, label persen, legenda. Cermin dari
+/// `pie::to_svg`, memakai geometri `PieScene` yang sama.
+fn draw_pie(p: &egui::Painter, ps: &PieScene, ts: &impl Fn(f64, f64) -> Pos2, zoom: f32) {
+    if let Some(t) = &ps.title {
+        p.text(
+            ts(ps.title_pos.0, ps.title_pos.1),
+            Align2::CENTER_CENTER,
+            t,
+            FontId::proportional(16.0 * zoom),
+            TEXT,
+        );
+    }
+    let center = ts(ps.cx, ps.cy);
+    let r = ps.r as f32 * zoom;
+    if ps.slices.iter().map(|s| s.frac).sum::<f64>() <= f64::EPSILON {
+        p.circle_stroke(center, r, Stroke::new(1.6 * zoom, EDGE));
+    }
+    for (i, sl) in ps.slices.iter().enumerate() {
+        if sl.frac <= 0.0 {
+            continue;
+        }
+        draw_wedge(p, center, r, sl.start_angle, sl.end_angle, hex(flowmaid::style::accent(i)), zoom);
+    }
+    for sl in &ps.slices {
+        if sl.frac < pie::MIN_LABEL_FRAC {
+            continue;
+        }
+        let mid = (sl.start_angle + sl.end_angle) / 2.0;
+        let lx = ps.cx + ps.r * pie::LABEL_R * mid.sin();
+        let ly = ps.cy - ps.r * pie::LABEL_R * mid.cos();
+        p.text(
+            ts(lx, ly),
+            Align2::CENTER_CENTER,
+            format!("{:.0}%", sl.frac * 100.0),
+            FontId::proportional(13.0 * zoom),
+            Color32::WHITE,
+        );
+    }
+    for (i, row) in ps.legend.iter().enumerate() {
+        let sw = pie::SWATCH as f32 * zoom;
+        p.rect_filled(
+            Rect::from_min_size(ts(row.x, row.y - pie::SWATCH / 2.0), Vec2::splat(sw)),
+            2.0 * zoom,
+            hex(flowmaid::style::accent(i)),
+        );
+        p.text(
+            ts(row.x + pie::SWATCH + 8.0, row.y),
+            Align2::LEFT_CENTER,
+            &row.text,
+            FontId::proportional(13.0 * zoom),
+            TEXT,
+        );
+    }
+}
+
+/// One pie sector, tessellated as a triangle fan from the centre
+/// (valid for any sweep, unlike a single convex polygon), with white
+/// radial separators mirroring the SVG slice strokes.
+fn draw_wedge(p: &egui::Painter, center: Pos2, r: f32, a0: f64, a1: f64, color: Color32, zoom: f32) {
+    let span = a1 - a0;
+    if span >= std::f64::consts::TAU - 1e-6 {
+        p.circle_filled(center, r, color);
+        return;
+    }
+    let steps = ((span / 0.15).ceil() as usize).max(1);
+    let pt = |a: f64| Pos2::new(center.x + r * a.sin() as f32, center.y - r * a.cos() as f32);
+    let mut prev = pt(a0);
+    for k in 1..=steps {
+        let cur = pt(a0 + span * (k as f64 / steps as f64));
+        p.add(egui::epaint::PathShape::convex_polygon(
+            vec![center, prev, cur],
+            color,
+            Stroke::NONE,
+        ));
+        prev = cur;
+    }
+    let white = Stroke::new(1.5 * zoom, Color32::WHITE);
+    p.line_segment([center, pt(a0)], white);
+    p.line_segment([center, pt(a1)], white);
+}
+
+/// Sequence diagram: frames, lifelines, activation bars, notes,
+/// messages (with head glyphs), and participant boxes. Cermin dari
+/// `seq::to_svg`, memakai geometri `SeqScene` yang sama.
+fn draw_sequence(p: &egui::Painter, sc: &SeqScene, ts: &impl Fn(f64, f64) -> Pos2, zoom: f32) {
+    let guide = hex("#aeb6d8");
+    // Frame borders (background).
+    for f in &sc.frames {
+        p.rect_stroke(
+            Rect::from_min_max(ts(f.x, f.y), ts(f.x + f.w, f.y + f.h)),
+            4.0 * zoom,
+            Stroke::new(1.2 * zoom, guide),
+        );
+    }
+    // Lifelines (dashed) + activation bars.
+    for l in &sc.lifelines {
+        dashed_line(p, ts(l.x, l.y0), ts(l.x, l.y1), Stroke::new(1.0 * zoom, guide));
+    }
+    for a in &sc.activations {
+        p.rect(
+            Rect::from_min_max(ts(a.x - 4.0, a.y0), ts(a.x + 4.0, a.y1)),
+            0.0,
+            Color32::WHITE,
+            Stroke::new(1.4 * zoom, hex(flowmaid::style::accent(a.participant))),
+        );
+    }
+    // Frame chips, labels, and else/and dividers (over the lifelines).
+    for f in &sc.frames {
+        let kw = f.kind.keyword();
+        let cw = flowmaid::layout::text_width(kw) + 14.0;
+        p.rect(
+            Rect::from_min_max(ts(f.x, f.y), ts(f.x + cw, f.y + 18.0)),
+            0.0,
+            hex("#eef1fb"),
+            Stroke::new(1.0 * zoom, guide),
+        );
+        p.text(
+            ts(f.x + cw / 2.0, f.y + 9.0),
+            Align2::CENTER_CENTER,
+            kw,
+            FontId::proportional(13.0 * zoom),
+            TEXT,
+        );
+        if !f.label.is_empty() {
+            p.text(
+                ts(f.x + cw + 6.0, f.y + 9.0),
+                Align2::LEFT_CENTER,
+                format!("[{}]", f.label),
+                FontId::proportional(13.0 * zoom),
+                TEXT,
+            );
+        }
+        for (dy, dl) in &f.dividers {
+            dashed_line(p, ts(f.x, *dy), ts(f.x + f.w, *dy), Stroke::new(1.0 * zoom, guide));
+            if !dl.is_empty() {
+                p.text(
+                    ts(f.x + f.w / 2.0, dy + 12.0),
+                    Align2::CENTER_CENTER,
+                    format!("[{}]", dl),
+                    FontId::proportional(13.0 * zoom),
+                    TEXT,
+                );
+            }
+        }
+    }
+    // Notes.
+    for nb in &sc.notes {
+        p.rect(
+            Rect::from_min_max(ts(nb.x, nb.y), ts(nb.x + nb.w, nb.y + nb.h)),
+            3.0 * zoom,
+            hex("#fcf2da"),
+            Stroke::new(1.2 * zoom, hex("#d99114")),
+        );
+        p.text(
+            ts(nb.x + nb.w / 2.0, nb.y + nb.h / 2.0),
+            Align2::CENTER_CENTER,
+            &nb.text,
+            FontId::proportional(13.0 * zoom),
+            TEXT,
+        );
+    }
+    // Messages: polyline + head glyph + label (with autonumber).
+    for m in &sc.messages {
+        let stroke = Stroke::new(1.6 * zoom, EDGE);
+        for w in m.points.windows(2) {
+            let (a, b) = (ts(w[0].0, w[0].1), ts(w[1].0, w[1].1));
+            if m.dashed {
+                dashed_line(p, a, b, stroke);
+            } else {
+                p.line_segment([a, b], stroke);
+            }
+        }
+        let np = m.points.len();
+        draw_seq_head(p, &seq::head(m.points[np - 1], m.points[np - 2], m.head), ts, zoom);
+        if m.text.is_empty() && m.number.is_none() {
+            continue;
+        }
+        let anchor = if m.label_centered {
+            Align2::CENTER_CENTER
+        } else {
+            Align2::LEFT_CENTER
+        };
+        let label = match m.number {
+            Some(k) => format!("{k}. {}", m.text),
+            None => m.text.clone(),
+        };
+        p.text(
+            ts(m.label_pos.0, m.label_pos.1),
+            anchor,
+            label,
+            FontId::proportional(13.0 * zoom),
+            TEXT,
+        );
+    }
+    // Participant boxes last (crisp over the lifeline tops).
+    for (i, b) in sc.boxes.iter().enumerate() {
+        let accent = hex(flowmaid::style::accent(i));
+        let (fill, text_fill) = if b.actor {
+            (Color32::WHITE, accent)
+        } else {
+            (accent, Color32::WHITE)
+        };
+        p.rect(
+            Rect::from_min_max(ts(b.x, b.y), ts(b.x + b.w, b.y + b.h)),
+            4.0 * zoom,
+            fill,
+            Stroke::new(1.6 * zoom, accent),
+        );
+        p.text(
+            ts(b.x + b.w / 2.0, b.y + b.h / 2.0),
+            Align2::CENTER_CENTER,
+            &b.label,
+            FontId::proportional(13.5 * zoom),
+            text_fill,
+        );
+    }
+}
+
+/// Filled-triangle / open head for a sequence message (plain
+/// geometry from `seq::head`).
+fn draw_seq_head(p: &egui::Painter, h: &seq::Head, ts: &impl Fn(f64, f64) -> Pos2, zoom: f32) {
+    if !h.polygon.is_empty() {
+        let pts: Vec<Pos2> = h.polygon.iter().map(|(x, y)| ts(*x, *y)).collect();
+        p.add(egui::epaint::PathShape::convex_polygon(pts, EDGE, Stroke::NONE));
+    }
+    for [a, b] in &h.segments {
+        p.line_segment([ts(a.0, a.1), ts(b.0, b.1)], Stroke::new(1.6 * zoom, EDGE));
+    }
+}
+
 /// Kepala panah di ujung bezier, searah turunan kurva di t=1.
 fn arrow_head(p: &egui::Painter, b: [Pos2; 4], color: Color32, zoom: f32) {
     let tip = b[3];
@@ -1511,5 +1819,31 @@ mod tests {
         assert!(a.boxes.is_empty() && a.rels.is_empty(), "class aux must be cleared");
         // Export follows the active model without panicking.
         assert!(a.export_svg().contains("<svg"));
+    }
+
+    #[test]
+    fn reparse_handles_static_pie_and_sequence_models() {
+        let mut a = app();
+        // Pie: geometry stored, no draggable positions, class/ER aux clear.
+        a.src = "pie\n\"a\" : 3\n\"b\" : 1".into();
+        a.reparse();
+        assert!(matches!(a.model, Model::Pie(_)));
+        assert!(a.pie.is_some() && a.seq.is_none());
+        assert!(a.pos.is_empty(), "pie has no draggable nodes");
+        assert_eq!(a.pie.as_ref().unwrap().slices.len(), 2);
+        assert!(a.export_svg().contains("<svg"));
+
+        // Sequence: geometry stored, pie aux cleared on switch.
+        a.src = "sequenceDiagram\nA->>B: hi\nNote over A: n".into();
+        a.reparse();
+        assert!(matches!(a.model, Model::Sequence(_)));
+        assert!(a.seq.is_some() && a.pie.is_none(), "pie aux must be cleared");
+        assert!(!a.seq.as_ref().unwrap().messages.is_empty());
+        assert!(a.export_svg().contains("</svg>"));
+
+        // Back to a flowchart clears both static scenes.
+        a.src = "flowchart TD\nX --> Y".into();
+        a.reparse();
+        assert!(a.pie.is_none() && a.seq.is_none());
     }
 }

@@ -7,6 +7,6 @@ repository = "https://github.com/go-routine-id/flowmaid-desktop"
 publish = false # demo app — run from source
 
 [dependencies]
-flowmaid = "0.9"
+flowmaid = "0.10"
 eframe = { version = "0.29", features = ["persistence"] }
 rfd = "0.17.2"
