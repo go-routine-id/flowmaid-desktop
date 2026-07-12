@@ -130,6 +130,7 @@ impl App {
             scn: Scene {
                 nodes: Vec::new(),
                 edges: Vec::new(),
+                clusters: Vec::new(),
                 width: 0.0,
                 height: 0.0,
             },
@@ -597,8 +598,26 @@ impl eframe::App for App {
                 self.reroute();
             }
 
-            // 2) Gambar edge lalu node/tabel dari geometri terbaru.
+            // 2) Gambar cluster subgraph (terluar dulu), lalu edge,
+            //    lalu node/tabel.
             let painter = ui.painter();
+            for c in &self.scn.clusters {
+                let tl = ts(c.x, c.y);
+                let rect = Rect::from_min_size(tl, Vec2::new(c.w as f32, c.h as f32) * zoom);
+                painter.rect(
+                    rect,
+                    8.0 * zoom,
+                    Color32::from_rgb(0xf7, 0xf8, 0xfd),
+                    Stroke::new(1.4 * zoom, Color32::from_rgb(0xc9, 0xcf, 0xe8)),
+                );
+                painter.text(
+                    tl + Vec2::new(10.0, 11.0) * zoom,
+                    Align2::LEFT_CENTER,
+                    &c.title,
+                    FontId::proportional(12.0 * zoom),
+                    TYPE_MUTED,
+                );
+            }
             let is_er = !self.tables.is_empty();
             for (i, e) in self.scn.edges.iter().enumerate() {
                 let p = e.bezier.map(|(x, y)| ts(x, y));
