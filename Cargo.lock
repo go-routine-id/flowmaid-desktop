@@ -1127,7 +1127,7 @@ checksum = "c7ac9093301133b4f653ed0c08c74aa50cb7c420314e2595360f14d321f41c6f"
 
 [[package]]
 name = "flowmaid-desktop"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "eframe",
  "flowmaid",

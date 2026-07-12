@@ -5,7 +5,8 @@ Interactive desktop diagram editor built on the [flowmaid](https://crates.io/cra
 
 ## Features
 
-- **Live Mermaid editing** — type `flowchart` or `erDiagram` text on the left, see the diagram instantly. A *last good render* pattern means half-typed text never flashes an error frame, and dragged positions are preserved by id while typing.
+- **VSCode-style layout** — a folder explorer on the left (open a folder, click `.mmd` files to open them), and a **Preview | Code** tabbed main area.
+- **Live Mermaid editing** — type `flowchart` or `erDiagram` in the Code tab, flip to Preview to see and drag the diagram. A *last good render* pattern means half-typed text never flashes an error frame, and dragged positions are preserved by id while typing.
 - **Drag nodes with the mouse** — edges re-route in realtime via `flowmaid::scene::route`.
 - **ER diagrams** — entities render as attribute tables with crow's foot cardinality notation (`flowmaid::er`), draggable like everything else.
 - **Zoom & pan** — pinch / ctrl+scroll / ± buttons to zoom (anchored at the cursor), scroll or drag empty canvas to pan; click the percentage button to reset.

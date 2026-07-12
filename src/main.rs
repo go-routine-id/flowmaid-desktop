@@ -1,12 +1,12 @@
 //! flowmaid desktop — editor diagram interaktif di atas engine flowmaid.
 //!
-//! - Panel kiri : editor teks Mermaid, live dengan pola "last good render"
-//! - Panel kanan: kanvas — node bisa DIGESER, edge mengikuti realtime
-//! - Zoom (pinch / ctrl+scroll / tombol ±) dan pan (scroll / drag kanvas)
-//! - Mendukung flowchart DAN erDiagram (tabel entitas + crow's foot,
-//!   sama-sama bisa digeser)
-//! - Drag & drop file .mmd ke jendela untuk membukanya
-//! - "Ekspor SVG" menyimpan susunan saat ini (termasuk hasil geseran)
+//! - Panel kiri : explorer folder ala VSCode (klik file .mmd untuk buka)
+//! - Area utama : tab Preview | Code
+//!     - Preview: kanvas — node bisa DIGESER, edge mengikuti realtime,
+//!       zoom (pinch / ctrl+scroll / tombol ±) dan pan (scroll / drag)
+//!     - Code   : editor teks Mermaid, live dengan pola "last good render"
+//! - Mendukung flowchart DAN erDiagram (tabel entitas + crow's foot)
+//! - Drag & drop file .mmd ke jendela untuk membukanya; Ekspor SVG
 //!
 //! Jalankan: `cargo run --release` (engine `flowmaid` ditarik
 //! langsung dari crates.io).
@@ -117,6 +117,13 @@ enum Pending {
     OpenPath(PathBuf),
 }
 
+/// Tab area utama: pratinjau diagram atau editor teks.
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Preview,
+    Code,
+}
+
 /// Dokumen valid terakhir — flowchart atau diagram ER.
 enum Model {
     Flow(Graph),
@@ -144,6 +151,7 @@ struct App {
     // menyentuh filesystem tiap frame. Ok(entries) sudah ter-filter
     // & terurut; Err = pesan gagal baca (mis. folder tercabut).
     dir_cache: HashMap<PathBuf, Result<Vec<PathBuf>, String>>,
+    view: View, // tab aktif: Preview / Code
     pending: Option<Pending>, // aksi menunggu konfirmasi buang-perubahan
     last_title: String,
     model: Model, // dokumen valid terakhir
@@ -173,6 +181,7 @@ impl App {
             recent,
             workspace,
             dir_cache: HashMap::new(),
+            view: View::Code,
             pending: None,
             last_title: String::new(),
             model: Model::Flow(Graph::default()),
@@ -679,13 +688,13 @@ impl eframe::App for App {
             });
         });
 
-        // Explorer folder ala VSCode — panel paling kiri.
-        if let Some(ws) = self.workspace.clone() {
-            egui::SidePanel::left("explorer")
-                .resizable(true)
-                .default_width(210.0)
-                .width_range(150.0..=420.0)
-                .show(ctx, |ui| {
+        // Explorer folder ala VSCode — panel kiri, selalu tampil.
+        egui::SidePanel::left("explorer")
+            .resizable(true)
+            .default_width(220.0)
+            .width_range(160.0..=440.0)
+            .show(ctx, |ui| match self.workspace.clone() {
+                Some(ws) => {
                     ui.horizontal(|ui| {
                         ui.strong(
                             ws.file_name()
@@ -706,46 +715,64 @@ impl eframe::App for App {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         self.draw_tree(ui, &ws);
                     });
-                });
-        }
+                }
+                None => {
+                    ui.add_space(8.0);
+                    ui.label("Belum ada folder terbuka.");
+                    ui.add_space(6.0);
+                    if ui.button("📂 Buka Folder…").clicked() {
+                        self.open_folder_dialog();
+                    }
+                    ui.add_space(4.0);
+                    ui.small("⇧⌘O — jelajahi file .mmd di sisi kiri.");
+                }
+            });
 
-        egui::SidePanel::left("editor")
-            .default_width(330.0)
-            .show(ctx, |ui| {
-                ui.heading("flowmaid");
-                ui.label("Geser node di kanan, edit teks di bawah,\natau drop file .mmd ke jendela ini.");
-                ui.horizontal(|ui| {
-                    if ui.button("Tata ulang otomatis").clicked() {
-                        self.autolayout();
-                    }
-                    if ui.button("Ekspor SVG").clicked() {
-                        self.export_svg_file();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("−").clicked() {
+        // Toolbar: tab Preview | Code di kiri, aksi di kanan.
+        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.view, View::Preview, "◇ Preview");
+                ui.selectable_value(&mut self.view, View::Code, "‹ › Code");
+                ui.separator();
+                if ui.button("Tata ulang").on_hover_text("tata letak otomatis").clicked() {
+                    self.autolayout();
+                }
+                if ui.button("Ekspor SVG").clicked() {
+                    self.export_svg_file();
+                }
+                if self.view == View::Preview {
+                    ui.separator();
+                    if ui.small_button("−").clicked() {
                         self.zoom_around(1.0 / 1.25, self.canvas_size / 2.0);
                     }
                     if ui
-                        .button(format!("{:.0}%", self.zoom * 100.0))
-                        .on_hover_text("klik untuk reset tampilan")
+                        .small_button(format!("{:.0}%", self.zoom * 100.0))
+                        .on_hover_text("reset tampilan")
                         .clicked()
                     {
                         self.reset_view();
                     }
-                    if ui.button("+").clicked() {
+                    if ui.small_button("+").clicked() {
                         self.zoom_around(1.25, self.canvas_size / 2.0);
                     }
-                    ui.small("pinch/ctrl+scroll = zoom\nscroll / drag kanvas = geser");
-                });
-                match &self.error {
-                    Some(e) => {
-                        ui.colored_label(Color32::from_rgb(200, 60, 60), format!("parse: {}", e));
-                    }
-                    None => {
-                        ui.label(&self.status);
-                    }
                 }
+                // Status / error parse di ujung kanan.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    match &self.error {
+                        Some(e) => {
+                            ui.colored_label(Color32::from_rgb(200, 60, 60), format!("parse: {e}"));
+                        }
+                        None => {
+                            ui.label(&self.status);
+                        }
+                    }
+                });
+            });
+        });
+
+        // Tab Code: editor teks penuh.
+        if self.view == View::Code {
+            egui::CentralPanel::default().show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let r = ui.add(
                         egui::TextEdit::multiline(&mut self.src)
@@ -758,6 +785,10 @@ impl eframe::App for App {
                     }
                 });
             });
+            // Judul jendela dihitung di akhir walau tab Code aktif.
+            self.sync_title(ctx);
+            return;
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let canvas = ui.max_rect();
@@ -883,9 +914,15 @@ impl eframe::App for App {
             }
         });
 
-        // Judul jendela dihitung di AKHIR frame — setelah semua
-        // mutasi state — supaya indikator dirty tidak telat satu
-        // frame sesudah ⌘S (ditemukan bughunter).
+        self.sync_title(ctx);
+    }
+}
+
+impl App {
+    /// Judul jendela dihitung di AKHIR frame — setelah semua mutasi
+    /// state — supaya indikator dirty tidak telat satu frame sesudah
+    /// ⌘S (ditemukan bughunter). Hanya mengirim perintah saat berubah.
+    fn sync_title(&mut self, ctx: &egui::Context) {
         let title = format!(
             "{}{} — flowmaid desktop",
             if self.dirty() { "• " } else { "" },
