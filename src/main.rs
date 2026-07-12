@@ -620,10 +620,17 @@ impl eframe::App for App {
             }
             let is_er = !self.tables.is_empty();
             for (i, e) in self.scn.edges.iter().enumerate() {
+                if matches!(e.kind, EdgeKind::Invisible) {
+                    continue; // link penata layout — tidak digambar
+                }
                 let p = e.bezier.map(|(x, y)| ts(x, y));
-                let sw = (if matches!(e.kind, EdgeKind::Thick) { 3.4 } else { 1.7 }) * zoom;
+                let sw = (if matches!(e.kind, EdgeKind::Thick | EdgeKind::ThickOpen) {
+                    3.4
+                } else {
+                    1.7
+                }) * zoom;
                 let stroke = Stroke::new(sw, EDGE);
-                if matches!(e.kind, EdgeKind::Dotted) {
+                if matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen) {
                     dashed_bezier(painter, p, stroke);
                 } else {
                     painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
@@ -638,7 +645,7 @@ impl eframe::App for App {
                     let (cf, ct) = self.cards[i];
                     draw_glyph(painter, &er::glyph(e.bezier[0], e.bezier[1], cf), &ts, zoom);
                     draw_glyph(painter, &er::glyph(e.bezier[3], e.bezier[2], ct), &ts, zoom);
-                } else if !matches!(e.kind, EdgeKind::Open) {
+                } else if e.kind.has_arrow() {
                     arrow_head(painter, p, EDGE, zoom);
                 }
                 if let Some((t, (lx, ly), lw)) = &e.label {
