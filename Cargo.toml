@@ -8,5 +8,15 @@ publish = false # demo app — run from source
 
 [dependencies]
 flowmaid = "0.10"
+# Fitur default dipertahankan: accesskit TIDAK dibuang — pohon
+# aksesibilitasnya lazy (baru dibangun saat screen reader terhubung),
+# jadi biaya runtime-nya ~nol sedangkan membuangnya mematikan
+# VoiceOver/NVDA (temuan verifikasi audit memory).
 eframe = { version = "0.29", features = ["persistence"] }
 rfd = "0.17.2"
+
+# Rampingkan binary release dan bantu inlining lintas-crate.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -27,11 +27,17 @@ use flowmaid::seq::{self, SeqScene};
 use flowmaid::Document;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 const EDGE: Color32 = Color32::from_rgb(0x44, 0x50, 0x7a);
 const TEXT: Color32 = Color32::from_rgb(0x23, 0x28, 0x40);
 const LABEL_BORDER: Color32 = Color32::from_rgb(0xd5, 0xd9, 0xec);
 const TYPE_MUTED: Color32 = Color32::from_rgb(0x6a, 0x70, 0x86);
+// Warna tetap jalur gambar sequence — const, bukan hex() per frame.
+const GUIDE: Color32 = Color32::from_rgb(0xae, 0xb6, 0xd8);
+const CHIP_FILL: Color32 = Color32::from_rgb(0xee, 0xf1, 0xfb);
+const NOTE_FILL: Color32 = Color32::from_rgb(0xfc, 0xf2, 0xda);
+const NOTE_STROKE: Color32 = Color32::from_rgb(0xd9, 0x91, 0x14);
 
 /// Warna CSS (tema engine / style user) → Color32, supaya kanvas
 /// dan ekspor SVG memakai warna yang persis sama. Mendukung
@@ -77,6 +83,29 @@ fn hex(c: &str) -> Color32 {
         "lightgray" | "lightgrey" => Color32::from_rgb(211, 211, 211),
         _ => Color32::GRAY,
     }
+}
+
+/// FontId proporsional dengan ukuran TERKUANTISASI: kelipatan 0.5 pt,
+/// lantai 2 pt. Ukuran f32 kontinu (mis. `13.0 * zoom`) membuat egui
+/// merasterisasi set glyph baru untuk TIAP nilai unik dan menaruhnya
+/// di atlas font yang tak pernah menyusut — atlas membengkak tanpa
+/// batas selama pinch-zoom (temuan audit memory). 0.5 pt = 1 piksel
+/// fisik di layar 2x, granularitas terhalus yang epaint render.
+fn zfont(base: f32, zoom: f32) -> FontId {
+    FontId::proportional(((base * zoom).max(2.0) * 2.0).round() / 2.0)
+}
+
+/// Warna accent engine di-parse sekali, bukan `hex()` (parsing string
+/// CSS) per elemen per frame.
+fn accent_color(i: usize) -> Color32 {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Vec<Color32>> = OnceLock::new();
+    let t = TABLE.get_or_init(|| {
+        (0..flowmaid::style::ACCENTS.len())
+            .map(|k| hex(flowmaid::style::accent(k)))
+            .collect()
+    });
+    t[i % t.len()]
 }
 
 const MIN_ZOOM: f32 = 0.2;
@@ -163,6 +192,15 @@ impl Model {
     }
 }
 
+/// Satu entri hasil listing folder. Nama tampilan & jenis (folder /
+/// file) di-precompute saat cache diisi, supaya draw_tree tidak
+/// melakukan syscall stat() maupun alokasi String per entri per frame.
+struct TreeEntry {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+}
+
 struct App {
     src: String,
     path: Option<PathBuf>, // file yang sedang dibuka (None = belum disimpan)
@@ -172,10 +210,14 @@ struct App {
     // Cache isi tiap folder yang sudah dibaca — explorer tak lagi
     // menyentuh filesystem tiap frame. Ok(entries) sudah ter-filter
     // & terurut; Err = pesan gagal baca (mis. folder tercabut).
-    dir_cache: HashMap<PathBuf, Result<Vec<PathBuf>, String>>,
+    // Rc: draw_tree meminjam listing tanpa deep-clone per frame.
+    dir_cache: HashMap<PathBuf, Rc<Result<Vec<TreeEntry>, String>>>,
     view: View,               // tab aktif: Preview / Code
     pending: Option<Pending>, // aksi menunggu konfirmasi buang-perubahan
     last_title: String,
+    // Kunci perubahan judul jendela (None = belum pernah dihitung).
+    last_dirty: Option<bool>,
+    last_titled_path: Option<PathBuf>,
     model: Model,             // dokumen valid terakhir
     pos: Vec<(f64, f64)>,     // posisi node/entitas, milik aplikasi (bisa digeser)
     scn: Scene,               // geometri terkini untuk digambar
@@ -185,6 +227,10 @@ struct App {
     rels: Vec<RelStyle>,      // gaya/kardinalitas relasi class, sejajar scn.edges
     pie: Option<PieScene>,    // geometri pie (Some hanya untuk Model::Pie)
     seq: Option<SeqScene>,    // geometri sequence (Some hanya untuk Model::Sequence)
+    // Precompute tampilan diagram statis (hindari format! per frame):
+    pie_labels: Vec<Option<String>>, // "NN%" per slice; None = terlalu tipis
+    pie_empty: bool,                 // total 0 → outline saja
+    seq_labels: Vec<String>,         // label pesan final ("N. teks" / teks)
     error: Option<String>,
     status: String,
     zoom: f32,         // faktor zoom kanvas (1.0 = 100%)
@@ -210,6 +256,8 @@ impl App {
             view: View::Split,
             pending: None,
             last_title: String::new(),
+            last_dirty: None,
+            last_titled_path: None,
             model: Model::Flow(Graph::default()),
             pos: Vec::new(),
             scn: Scene {
@@ -225,6 +273,9 @@ impl App {
             rels: Vec::new(),
             pie: None,
             seq: None,
+            pie_labels: Vec::new(),
+            pie_empty: false,
+            seq_labels: Vec::new(),
             error: None,
             status: "geser node dengan mouse".into(),
             zoom: 1.0,
@@ -238,63 +289,73 @@ impl App {
     /// Parse ulang teks. Bila gagal, pertahankan render valid terakhir
     /// (pola "last good render"). Posisi node/entitas yang kuncinya
     /// masih ada dipertahankan supaya geseran tidak hilang saat mengetik.
+    ///
+    /// Auto-layout hanya dihitung bila ada node BARU (kunci tak
+    /// ditemukan) — saat mengetik biasa semua kunci ketemu, jadi
+    /// keystroke tidak membayar layout penuh yang langsung dibuang.
     fn reparse(&mut self) {
         match flowmaid::parser::parse_document(&self.src) {
             Ok(doc) => {
-                let old: HashMap<String, (f64, f64)> = self
-                    .model
+                // Model lama ditahan hidup di lokal supaya peta posisi
+                // bisa meminjam kuncinya (tanpa alokasi String).
+                let prev = std::mem::replace(&mut self.model, Model::Flow(Graph::default()));
+                let prev_pos = std::mem::take(&mut self.pos);
+                let old: HashMap<&str, (f64, f64)> = prev
                     .keys()
-                    .iter()
-                    .zip(&self.pos)
-                    .map(|(k, p)| (k.to_string(), *p))
+                    .into_iter()
+                    .zip(prev_pos.iter().copied())
                     .collect();
                 match doc {
                     Document::Flowchart(g) => {
-                        let auto = scene(&g);
+                        let mut auto = None;
                         self.pos = g
                             .nodes
                             .iter()
                             .enumerate()
                             .map(|(i, n)| {
-                                *old.get(n.id.as_str())
-                                    .unwrap_or(&(auto.nodes[i].x, auto.nodes[i].y))
+                                old.get(n.id.as_str()).copied().unwrap_or_else(|| {
+                                    let a = auto.get_or_insert_with(|| scene(&g));
+                                    (a.nodes[i].x, a.nodes[i].y)
+                                })
                             })
                             .collect();
                         self.model = Model::Flow(g);
                     }
                     Document::Er(d) => {
-                        let auto = er::scene(&d);
+                        let mut auto = None;
                         self.pos = d
                             .entities
                             .iter()
                             .enumerate()
                             .map(|(i, e)| {
-                                *old.get(e.name.as_str())
-                                    .unwrap_or(&(auto.scene.nodes[i].x, auto.scene.nodes[i].y))
+                                old.get(e.name.as_str()).copied().unwrap_or_else(|| {
+                                    let a = auto.get_or_insert_with(|| er::scene(&d));
+                                    (a.scene.nodes[i].x, a.scene.nodes[i].y)
+                                })
                             })
                             .collect();
                         self.model = Model::Er(d);
                     }
                     Document::Class(d) => {
-                        let auto = class::scene(&d);
+                        let mut auto = None;
                         self.pos = d
                             .classes
                             .iter()
                             .enumerate()
                             .map(|(i, c)| {
-                                *old.get(c.name.as_str())
-                                    .unwrap_or(&(auto.scene.nodes[i].x, auto.scene.nodes[i].y))
+                                old.get(c.name.as_str()).copied().unwrap_or_else(|| {
+                                    let a = auto.get_or_insert_with(|| class::scene(&d));
+                                    (a.scene.nodes[i].x, a.scene.nodes[i].y)
+                                })
                             })
                             .collect();
                         self.model = Model::Class(d);
                     }
                     // Pie & sequence are static — no per-node positions.
                     Document::Pie(d) => {
-                        self.pos = Vec::new();
                         self.model = Model::Pie(d);
                     }
                     Document::Sequence(d) => {
-                        self.pos = Vec::new();
                         self.model = Model::Sequence(d);
                     }
                 }
@@ -360,16 +421,37 @@ impl App {
         self.rels.clear();
         self.pie = None;
         self.seq = None;
+        self.pie_labels.clear();
+        self.seq_labels.clear();
     }
 
     /// Simpan geometri pie statis; `scn` dikosongkan (tak ada node
-    /// yang bisa digeser) tapi memegang ukuran kanvas.
+    /// yang bisa digeser) tapi memegang ukuran kanvas. Label persen
+    /// dan flag kosong di-precompute agar draw_pie bebas alokasi.
     fn set_static_pie(&mut self, ps: PieScene) {
+        self.pie_labels = ps
+            .slices
+            .iter()
+            .map(|sl| {
+                (sl.frac >= pie::MIN_LABEL_FRAC).then(|| format!("{:.0}%", sl.frac * 100.0))
+            })
+            .collect();
+        self.pie_empty = ps.slices.iter().map(|s| s.frac).sum::<f64>() <= f64::EPSILON;
         self.scn = blank_scene(ps.width, ps.height);
         self.pie = Some(ps);
     }
 
+    /// Simpan geometri sequence statis; label pesan final (termasuk
+    /// prefiks autonumber) di-precompute sekali, bukan format! per frame.
     fn set_static_seq(&mut self, sc: SeqScene) {
+        self.seq_labels = sc
+            .messages
+            .iter()
+            .map(|m| match m.number {
+                Some(k) => format!("{k}. {}", m.text),
+                None => m.text.clone(),
+            })
+            .collect();
         self.scn = blank_scene(sc.width, sc.height);
         self.seq = Some(sc);
     }
@@ -522,9 +604,15 @@ impl App {
     /// Isi satu folder (folder-dulu, alfabetis, ter-filter),
     /// di-cache supaya explorer tak menyentuh filesystem tiap frame.
     /// Symlink direktori dilewati agar tak ada siklus tak berujung.
-    fn listing(&mut self, dir: &Path) -> Result<Vec<PathBuf>, String> {
+    fn listing(&mut self, dir: &Path) -> Rc<Result<Vec<TreeEntry>, String>> {
         if let Some(cached) = self.dir_cache.get(dir) {
-            return cached.clone();
+            return Rc::clone(cached);
+        }
+        // Penjaga pertumbuhan: cache tak pernah dievict selama sesi
+        // (folder tertutup tetap tersimpan). Reset kasar saat besar;
+        // frame berikutnya mengisi ulang hanya yang terlihat.
+        if self.dir_cache.len() > 512 {
+            self.dir_cache.clear();
         }
         let is_symlink = |p: &Path| {
             std::fs::symlink_metadata(p)
@@ -532,43 +620,41 @@ impl App {
                 .unwrap_or(false)
         };
         let result = std::fs::read_dir(dir).map_err(|e| e.to_string()).map(|rd| {
-            let mut v: Vec<PathBuf> = rd
+            let mut v: Vec<TreeEntry> = rd
                 .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    let name = p
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
+                .filter_map(|e| {
+                    let path = e.path();
+                    let name = path.file_name()?.to_string_lossy().into_owned();
                     if name.starts_with('.') || name == "target" {
-                        return false;
+                        return None;
                     }
+                    // Folder asli (bukan symlink) atau file diagram —
+                    // is_dir dihitung SEKALI di sini, bukan per frame.
+                    let is_dir = path.is_dir() && !is_symlink(&path);
                     let lower = name.to_lowercase();
-                    // Folder asli (bukan symlink) atau file diagram.
-                    (p.is_dir() && !is_symlink(p))
-                        || lower.ends_with(".mmd")
-                        || lower.ends_with(".txt")
+                    if is_dir || lower.ends_with(".mmd") || lower.ends_with(".txt") {
+                        Some(TreeEntry { path, name, is_dir })
+                    } else {
+                        None
+                    }
                 })
                 .collect();
-            v.sort_by_key(|p| {
-                (
-                    !p.is_dir(),
-                    p.file_name()
-                        .map(|n| n.to_string_lossy().to_lowercase())
-                        .unwrap_or_default(),
-                )
-            });
+            v.sort_by_cached_key(|t| (!t.is_dir, t.name.to_lowercase()));
             v
         });
-        self.dir_cache.insert(dir.to_path_buf(), result.clone());
-        result
+        let rc = Rc::new(result);
+        self.dir_cache.insert(dir.to_path_buf(), Rc::clone(&rc));
+        rc
     }
 
     /// Pohon file rekursif untuk explorer: folder bisa dilipat,
     /// file `.mmd`/`.txt` bisa diklik untuk dibuka (lewat penjaga
     /// perubahan-belum-disimpan), file aktif di-highlight.
     fn draw_tree(&mut self, ui: &mut egui::Ui, dir: &Path) {
-        let entries = match self.listing(dir) {
+        // Rc lokal menahan data hidup — rekursi &mut self tetap aman
+        // walau cache dievict di tengah jalan.
+        let listing = self.listing(dir);
+        let entries = match listing.as_ref() {
             Ok(v) => v,
             Err(e) => {
                 ui.colored_label(
@@ -578,19 +664,16 @@ impl App {
                 return;
             }
         };
-        for p in entries {
-            let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-                continue;
-            };
-            if p.is_dir() {
-                egui::CollapsingHeader::new(&name)
-                    .id_salt(&p)
+        for t in entries {
+            if t.is_dir {
+                egui::CollapsingHeader::new(&t.name)
+                    .id_salt(&t.path)
                     .default_open(false)
-                    .show(ui, |ui| self.draw_tree(ui, &p));
+                    .show(ui, |ui| self.draw_tree(ui, &t.path));
             } else {
-                let selected = self.path.as_deref() == Some(p.as_path());
-                if ui.selectable_label(selected, &name).clicked() && !selected {
-                    self.request(Pending::OpenPath(p.clone()));
+                let selected = self.path.as_deref() == Some(t.path.as_path());
+                if ui.selectable_label(selected, &t.name).clicked() && !selected {
+                    self.request(Pending::OpenPath(t.path.clone()));
                 }
             }
         }
@@ -641,6 +724,11 @@ impl eframe::App for App {
                 .unwrap_or_default(),
         );
     }
+
+    // Catatan audit: persist_egui_memory sengaja DIBIARKAN default
+    // (true) — mematikannya ikut menghilangkan lebar panel, posisi
+    // scroll, dan UI zoom antar-restart, dan merusak restorasi
+    // geometri window saat user pernah ⌘+/− (temuan verifikasi).
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Shortcut file. Simpan-Sebagai dicek sebelum Simpan supaya
@@ -936,17 +1024,15 @@ impl App {
         // Koordinat dunia (scene) -> layar.
         let ts = |x: f64, y: f64| canvas.min + pan + Vec2::new(x as f32, y as f32) * zoom;
 
-        // 1) Interaksi drag NODE dulu (rect dalam koordinat layar).
-        let rects: Vec<Rect> = self
-            .scn
-            .nodes
-            .iter()
-            .map(|n| Rect::from_center_size(ts(n.x, n.y), Vec2::new(n.w as f32, n.h as f32) * zoom))
-            .collect();
+        // 1) Interaksi drag NODE dulu (rect dalam koordinat layar) —
+        //    rect dihitung inline, tanpa Vec perantara per frame.
         let mut moved = false;
         let mut hovered_node: Option<usize> = None;
-        for (i, rect) in rects.iter().enumerate() {
-            let resp = ui.interact(*rect, egui::Id::new(("flowrs-node", i)), Sense::drag());
+        for i in 0..self.scn.nodes.len() {
+            let n = &self.scn.nodes[i];
+            let rect =
+                Rect::from_center_size(ts(n.x, n.y), Vec2::new(n.w as f32, n.h as f32) * zoom);
+            let resp = ui.interact(rect, egui::Id::new(("flowrs-node", i)), Sense::drag());
             if resp.hovered() || resp.dragged() {
                 ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
                 hovered_node = Some(i);
@@ -962,9 +1048,24 @@ impl App {
             self.reroute();
         }
 
-        // 2) Gambar cluster subgraph (terluar dulu), lalu edge,
-        //    lalu node/tabel.
+        // 2) "Kertas" putih seukuran kanvas diagram — cermin persis
+        //    latar putih ekspor SVG. Tanpa ini, label yang digambar
+        //    langsung di latar (pesan/frame sequence, legenda pie)
+        //    memakai teks gelap di atas tema gelap = tak terbaca.
         let painter = ui.painter();
+        if self.scn.width > 0.0 && self.scn.height > 0.0 {
+            let paper = Rect::from_min_max(ts(0.0, 0.0), ts(self.scn.width, self.scn.height))
+                .expand(16.0 * zoom);
+            painter.rect(
+                paper,
+                8.0 * zoom,
+                Color32::WHITE,
+                Stroke::new(1.0, LABEL_BORDER),
+            );
+        }
+
+        // 3) Gambar cluster subgraph (terluar dulu), lalu edge,
+        //    lalu node/tabel.
         for c in &self.scn.clusters {
             let tl = ts(c.x, c.y);
             let rect = Rect::from_min_size(tl, Vec2::new(c.w as f32, c.h as f32) * zoom);
@@ -978,8 +1079,9 @@ impl App {
                 tl + Vec2::new(10.0, 11.0) * zoom,
                 Align2::LEFT_CENTER,
                 &c.title,
-                // Jaga agar judul tetap terbaca saat zoom kecil.
-                FontId::proportional((12.0 * zoom).max(6.0)),
+                // Jaga agar judul tetap terbaca saat zoom kecil
+                // (12 × 0.5 = lantai 6 pt, tetap terkuantisasi).
+                zfont(12.0, zoom.max(0.5)),
                 TYPE_MUTED,
             );
         }
@@ -1045,19 +1147,19 @@ impl App {
                     c,
                     Align2::CENTER_CENTER,
                     t,
-                    FontId::proportional(13.0 * zoom),
+                    zfont(13.0, zoom),
                     TEXT,
                 );
             }
         }
         if is_class {
             for (i, (n, b)) in self.scn.nodes.iter().zip(&self.boxes).enumerate() {
-                let accent = hex(flowmaid::style::accent(i));
+                let accent = accent_color(i);
                 draw_class_box(painter, n, b, ts(n.x, n.y), zoom, accent, hovered_node == Some(i));
             }
         } else if is_er {
             for (i, (n, t)) in self.scn.nodes.iter().zip(&self.tables).enumerate() {
-                let accent = hex(flowmaid::style::accent(i));
+                let accent = accent_color(i);
                 draw_table(
                     painter,
                     n,
@@ -1076,19 +1178,26 @@ impl App {
 
         // Static diagrams draw from their own geometry (scn is empty).
         if let Some(ps) = &self.pie {
-            draw_pie(painter, ps, &ts, zoom);
+            draw_pie(painter, ps, &self.pie_labels, self.pie_empty, &ts, zoom);
         } else if let Some(sq) = &self.seq {
-            draw_sequence(painter, sq, &ts, zoom);
+            draw_sequence(painter, sq, &self.seq_labels, &ts, zoom);
         }
     }
 
     /// Judul jendela dihitung di AKHIR frame — setelah semua mutasi
     /// state — supaya indikator dirty tidak telat satu frame sesudah
-    /// ⌘S (ditemukan bughunter). Hanya mengirim perintah saat berubah.
+    /// ⌘S (ditemukan bughunter). String judul hanya dibangun ulang
+    /// saat (dirty, path) berubah — bukan format! tiap frame.
     fn sync_title(&mut self, ctx: &egui::Context) {
+        let dirty = self.dirty();
+        if Some(dirty) == self.last_dirty && self.path == self.last_titled_path {
+            return;
+        }
+        self.last_dirty = Some(dirty);
+        self.last_titled_path.clone_from(&self.path);
         let title = format!(
             "{}{} — flowmaid desktop",
-            if self.dirty() { "• " } else { "" },
+            if dirty { "• " } else { "" },
             self.path
                 .as_ref()
                 .and_then(|p| p.file_name())
@@ -1197,7 +1306,7 @@ fn draw_node(p: &egui::Painter, n: &SceneNode, c: Pos2, zoom: f32, hovered: bool
         c,
         Align2::CENTER_CENTER,
         &n.label,
-        FontId::proportional(14.0 * zoom),
+        zfont(14.0, zoom),
         text_color,
     );
 }
@@ -1240,7 +1349,7 @@ fn draw_table(
         Pos2::new(c.x, y0 + hh / 2.0),
         Align2::CENTER_CENTER,
         &t.name,
-        FontId::proportional(13.5 * zoom),
+        zfont(13.5, zoom),
         Color32::WHITE,
     );
     let row_h = ROW_H as f32 * zoom;
@@ -1253,7 +1362,7 @@ fn draw_table(
             );
         }
         let cy = ry + row_h / 2.0;
-        let f = FontId::proportional(12.5 * zoom);
+        let f = zfont(12.5, zoom);
         p.text(
             Pos2::new(x0 + PAD as f32 * zoom, cy),
             Align2::LEFT_CENTER,
@@ -1337,11 +1446,11 @@ fn draw_class_box(
         Pos2::new(c.x, y0 + hh / 2.0),
         Align2::CENTER_CENTER,
         &b.name,
-        FontId::proportional(13.5 * zoom),
+        zfont(13.5, zoom),
         Color32::WHITE,
     );
     let row_h = ROW_H as f32 * zoom;
-    let font = FontId::proportional(12.5 * zoom);
+    let font = zfont(12.5, zoom);
     let comp_h =
         |rows: usize| (if rows == 0 { EMPTY_H as f32 } else { rows as f32 * ROW_H as f32 }) * zoom;
     // Pemisah + baris kompartemen, mulai dari `top`.
@@ -1403,7 +1512,7 @@ fn draw_card(
         ts(px, py),
         Align2::CENTER_CENTER,
         text,
-        FontId::proportional(11.0 * zoom),
+        zfont(11.0, zoom),
         TEXT,
     );
 }
@@ -1435,40 +1544,46 @@ fn dashed_line(p: &egui::Painter, a: Pos2, b: Pos2, stroke: Stroke) {
 }
 
 /// Pie chart: judul, sektor, label persen, legenda. Cermin dari
-/// `pie::to_svg`, memakai geometri `PieScene` yang sama.
-fn draw_pie(p: &egui::Painter, ps: &PieScene, ts: &impl Fn(f64, f64) -> Pos2, zoom: f32) {
+/// `pie::to_svg`, memakai geometri `PieScene` yang sama. `labels` /
+/// `empty` sudah di-precompute di `set_static_pie` (bebas alokasi).
+fn draw_pie(
+    p: &egui::Painter,
+    ps: &PieScene,
+    labels: &[Option<String>],
+    empty: bool,
+    ts: &impl Fn(f64, f64) -> Pos2,
+    zoom: f32,
+) {
     if let Some(t) = &ps.title {
         p.text(
             ts(ps.title_pos.0, ps.title_pos.1),
             Align2::CENTER_CENTER,
             t,
-            FontId::proportional(16.0 * zoom),
+            zfont(16.0, zoom),
             TEXT,
         );
     }
     let center = ts(ps.cx, ps.cy);
     let r = ps.r as f32 * zoom;
-    if ps.slices.iter().map(|s| s.frac).sum::<f64>() <= f64::EPSILON {
+    if empty {
         p.circle_stroke(center, r, Stroke::new(1.6 * zoom, EDGE));
     }
     for (i, sl) in ps.slices.iter().enumerate() {
         if sl.frac <= 0.0 {
             continue;
         }
-        draw_wedge(p, center, r, sl.start_angle, sl.end_angle, hex(flowmaid::style::accent(i)), zoom);
+        draw_wedge(p, center, r, sl.start_angle, sl.end_angle, accent_color(i), zoom);
     }
-    for sl in &ps.slices {
-        if sl.frac < pie::MIN_LABEL_FRAC {
-            continue;
-        }
+    for (sl, label) in ps.slices.iter().zip(labels) {
+        let Some(text) = label else { continue };
         let mid = (sl.start_angle + sl.end_angle) / 2.0;
         let lx = ps.cx + ps.r * pie::LABEL_R * mid.sin();
         let ly = ps.cy - ps.r * pie::LABEL_R * mid.cos();
         p.text(
             ts(lx, ly),
             Align2::CENTER_CENTER,
-            format!("{:.0}%", sl.frac * 100.0),
-            FontId::proportional(13.0 * zoom),
+            text,
+            zfont(13.0, zoom),
             Color32::WHITE,
         );
     }
@@ -1477,13 +1592,13 @@ fn draw_pie(p: &egui::Painter, ps: &PieScene, ts: &impl Fn(f64, f64) -> Pos2, zo
         p.rect_filled(
             Rect::from_min_size(ts(row.x, row.y - pie::SWATCH / 2.0), Vec2::splat(sw)),
             2.0 * zoom,
-            hex(flowmaid::style::accent(i)),
+            accent_color(i),
         );
         p.text(
             ts(row.x + pie::SWATCH + 8.0, row.y),
             Align2::LEFT_CENTER,
             &row.text,
-            FontId::proportional(13.0 * zoom),
+            zfont(13.0, zoom),
             TEXT,
         );
     }
@@ -1518,8 +1633,14 @@ fn draw_wedge(p: &egui::Painter, center: Pos2, r: f32, a0: f64, a1: f64, color: 
 /// Sequence diagram: frames, lifelines, activation bars, notes,
 /// messages (with head glyphs), and participant boxes. Cermin dari
 /// `seq::to_svg`, memakai geometri `SeqScene` yang sama.
-fn draw_sequence(p: &egui::Painter, sc: &SeqScene, ts: &impl Fn(f64, f64) -> Pos2, zoom: f32) {
-    let guide = hex("#aeb6d8");
+fn draw_sequence(
+    p: &egui::Painter,
+    sc: &SeqScene,
+    labels: &[String],
+    ts: &impl Fn(f64, f64) -> Pos2,
+    zoom: f32,
+) {
+    let guide = GUIDE;
     // Frame borders (background).
     for f in &sc.frames {
         p.rect_stroke(
@@ -1537,7 +1658,7 @@ fn draw_sequence(p: &egui::Painter, sc: &SeqScene, ts: &impl Fn(f64, f64) -> Pos
             Rect::from_min_max(ts(a.x - 4.0, a.y0), ts(a.x + 4.0, a.y1)),
             0.0,
             Color32::WHITE,
-            Stroke::new(1.4 * zoom, hex(flowmaid::style::accent(a.participant))),
+            Stroke::new(1.4 * zoom, accent_color(a.participant)),
         );
     }
     // Frame chips, labels, and else/and dividers (over the lifelines).
@@ -1547,14 +1668,14 @@ fn draw_sequence(p: &egui::Painter, sc: &SeqScene, ts: &impl Fn(f64, f64) -> Pos
         p.rect(
             Rect::from_min_max(ts(f.x, f.y), ts(f.x + cw, f.y + 18.0)),
             0.0,
-            hex("#eef1fb"),
+            CHIP_FILL,
             Stroke::new(1.0 * zoom, guide),
         );
         p.text(
             ts(f.x + cw / 2.0, f.y + 9.0),
             Align2::CENTER_CENTER,
             kw,
-            FontId::proportional(13.0 * zoom),
+            zfont(13.0, zoom),
             TEXT,
         );
         if !f.label.is_empty() {
@@ -1562,7 +1683,7 @@ fn draw_sequence(p: &egui::Painter, sc: &SeqScene, ts: &impl Fn(f64, f64) -> Pos
                 ts(f.x + cw + 6.0, f.y + 9.0),
                 Align2::LEFT_CENTER,
                 format!("[{}]", f.label),
-                FontId::proportional(13.0 * zoom),
+                zfont(13.0, zoom),
                 TEXT,
             );
         }
@@ -1573,7 +1694,7 @@ fn draw_sequence(p: &egui::Painter, sc: &SeqScene, ts: &impl Fn(f64, f64) -> Pos
                     ts(f.x + f.w / 2.0, dy + 12.0),
                     Align2::CENTER_CENTER,
                     format!("[{}]", dl),
-                    FontId::proportional(13.0 * zoom),
+                    zfont(13.0, zoom),
                     TEXT,
                 );
             }
@@ -1584,19 +1705,21 @@ fn draw_sequence(p: &egui::Painter, sc: &SeqScene, ts: &impl Fn(f64, f64) -> Pos
         p.rect(
             Rect::from_min_max(ts(nb.x, nb.y), ts(nb.x + nb.w, nb.y + nb.h)),
             3.0 * zoom,
-            hex("#fcf2da"),
-            Stroke::new(1.2 * zoom, hex("#d99114")),
+            NOTE_FILL,
+            Stroke::new(1.2 * zoom, NOTE_STROKE),
         );
         p.text(
             ts(nb.x + nb.w / 2.0, nb.y + nb.h / 2.0),
             Align2::CENTER_CENTER,
             &nb.text,
-            FontId::proportional(13.0 * zoom),
+            zfont(13.0, zoom),
             TEXT,
         );
     }
     // Messages: polyline + head glyph + label (with autonumber).
-    for m in &sc.messages {
+    // `labels` sudah di-precompute di set_static_seq (tanpa format!
+    // per frame); indeks sejajar dengan sc.messages.
+    for (i, m) in sc.messages.iter().enumerate() {
         let stroke = Stroke::new(1.6 * zoom, EDGE);
         for w in m.points.windows(2) {
             let (a, b) = (ts(w[0].0, w[0].1), ts(w[1].0, w[1].1));
@@ -1616,21 +1739,18 @@ fn draw_sequence(p: &egui::Painter, sc: &SeqScene, ts: &impl Fn(f64, f64) -> Pos
         } else {
             Align2::LEFT_CENTER
         };
-        let label = match m.number {
-            Some(k) => format!("{k}. {}", m.text),
-            None => m.text.clone(),
-        };
+        let label = labels.get(i).map(String::as_str).unwrap_or(&m.text);
         p.text(
             ts(m.label_pos.0, m.label_pos.1),
             anchor,
             label,
-            FontId::proportional(13.0 * zoom),
+            zfont(13.0, zoom),
             TEXT,
         );
     }
     // Participant boxes last (crisp over the lifeline tops).
     for (i, b) in sc.boxes.iter().enumerate() {
-        let accent = hex(flowmaid::style::accent(i));
+        let accent = accent_color(i);
         let (fill, text_fill) = if b.actor {
             (Color32::WHITE, accent)
         } else {
@@ -1646,7 +1766,7 @@ fn draw_sequence(p: &egui::Painter, sc: &SeqScene, ts: &impl Fn(f64, f64) -> Pos
             ts(b.x + b.w / 2.0, b.y + b.h / 2.0),
             Align2::CENTER_CENTER,
             &b.label,
-            FontId::proportional(13.5 * zoom),
+            zfont(13.5, zoom),
             text_fill,
         );
     }
