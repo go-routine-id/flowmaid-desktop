@@ -697,19 +697,32 @@ impl eframe::App for App {
             .show(ctx, |ui| match self.workspace.clone() {
                 Some(ws) => {
                     ui.horizontal(|ui| {
-                        ui.strong(
-                            ws.file_name()
-                                .map(|n| n.to_string_lossy().to_uppercase())
-                                .unwrap_or_else(|| "FOLDER".into()),
-                        );
+                        // Menu aksi dipasang lebih dulu di kanan, lalu
+                        // nama folder mengisi sisa ruang & terpotong
+                        // rapi bila panjang.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("tutup").clicked() {
-                                self.workspace = None;
-                                self.dir_cache.clear();
-                            }
-                            if ui.small_button("segarkan").clicked() {
-                                self.dir_cache.clear();
-                            }
+                            ui.menu_button("...", |ui| {
+                                if ui.button("Segarkan").clicked() {
+                                    self.dir_cache.clear();
+                                    ui.close_menu();
+                                }
+                                if ui.button("Tutup folder").clicked() {
+                                    self.workspace = None;
+                                    self.dir_cache.clear();
+                                    ui.close_menu();
+                                }
+                            });
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(
+                                        ws.file_name()
+                                            .map(|n| n.to_string_lossy().to_uppercase())
+                                            .unwrap_or_else(|| "FOLDER".into()),
+                                    )
+                                    .strong(),
+                                )
+                                .truncate(),
+                            );
                         });
                     });
                     ui.separator();
