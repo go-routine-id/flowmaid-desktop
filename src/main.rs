@@ -97,7 +97,12 @@ fn main() -> eframe::Result<()> {
                 .and_then(|s| s.get_string("recent"))
                 .map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
                 .unwrap_or_default();
-            Ok(Box::new(App::new(src, path, recent)))
+            let workspace = cc
+                .storage
+                .and_then(|s| s.get_string("workspace"))
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir());
+            Ok(Box::new(App::new(src, path, recent, workspace)))
         }),
     )
 }
@@ -132,6 +137,7 @@ struct App {
     path: Option<PathBuf>, // file yang sedang dibuka (None = belum disimpan)
     saved_src: String,     // isi terakhir yang tersimpan, untuk deteksi dirty
     recent: Vec<String>,   // file terakhir dibuka, terbaru di depan
+    workspace: Option<PathBuf>, // folder explorer ala VSCode (panel kiri)
     pending: Option<Pending>, // aksi menunggu konfirmasi buang-perubahan
     last_title: String,
     model: Model, // dokumen valid terakhir
@@ -147,13 +153,19 @@ struct App {
 }
 
 impl App {
-    fn new(src: String, path: Option<PathBuf>, recent: Vec<String>) -> Self {
+    fn new(
+        src: String,
+        path: Option<PathBuf>,
+        recent: Vec<String>,
+        workspace: Option<PathBuf>,
+    ) -> Self {
         let saved_src = src.clone();
         let mut app = App {
             src,
             path,
             saved_src,
             recent,
+            workspace,
             pending: None,
             last_title: String::new(),
             model: Model::Flow(Graph::default()),
@@ -376,6 +388,58 @@ impl App {
         }
     }
 
+    /// Pilih folder untuk panel explorer (ala VSCode).
+    fn open_folder_dialog(&mut self) {
+        let mut dlg = rfd::FileDialog::new();
+        if let Some(ws) = &self.workspace {
+            dlg = dlg.set_directory(ws);
+        }
+        if let Some(p) = dlg.pick_folder() {
+            self.status = format!("folder: {}", p.display());
+            self.workspace = Some(p);
+        }
+    }
+
+    /// Pohon file rekursif untuk explorer: folder bisa dilipat,
+    /// file `.mmd`/`.txt` bisa diklik untuk dibuka (lewat penjaga
+    /// perubahan-belum-disimpan), file aktif di-highlight.
+    fn draw_tree(&mut self, ui: &mut egui::Ui, dir: &Path) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        // Folder dulu, lalu file — masing-masing alfabetis.
+        entries.sort_by_key(|p| {
+            (
+                !p.is_dir(),
+                p.file_name()
+                    .map(|n| n.to_string_lossy().to_lowercase())
+                    .unwrap_or_default(),
+            )
+        });
+        for p in entries {
+            let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            if name.starts_with('.') || name == "target" {
+                continue;
+            }
+            if p.is_dir() {
+                egui::CollapsingHeader::new(&name)
+                    .id_salt(&p)
+                    .default_open(false)
+                    .show(ui, |ui| self.draw_tree(ui, &p));
+            } else if name.ends_with(".mmd") || name.ends_with(".txt") {
+                let selected = self.path.as_deref() == Some(p.as_path());
+                if ui
+                    .selectable_label(selected, format!("▤ {name}"))
+                    .clicked()
+                    && !selected
+                {
+                    self.request(Pending::OpenPath(p.clone()));
+                }
+            }
+        }
+    }
+
     /// Jalankan aksi yang bisa membuang perubahan; kalau dokumen
     /// dirty, tahan dulu di dialog konfirmasi.
     fn request(&mut self, act: Pending) {
@@ -406,6 +470,13 @@ impl App {
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string("recent", self.recent.join("\n"));
+        storage.set_string(
+            "workspace",
+            self.workspace
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        );
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -430,6 +501,8 @@ impl eframe::App for App {
         const SAVE_AS: KeyboardShortcut =
             KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S);
         const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
+        const OPEN_FOLDER: KeyboardShortcut =
+            KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::O);
         const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
         const NEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
         if ctx.input_mut(|i| i.consume_shortcut(&SAVE_AS)) {
@@ -437,7 +510,9 @@ impl eframe::App for App {
         } else if ctx.input_mut(|i| i.consume_shortcut(&SAVE)) {
             self.save_doc();
         }
-        if ctx.input_mut(|i| i.consume_shortcut(&OPEN)) {
+        if ctx.input_mut(|i| i.consume_shortcut(&OPEN_FOLDER)) {
+            self.open_folder_dialog();
+        } else if ctx.input_mut(|i| i.consume_shortcut(&OPEN)) {
             self.request(Pending::OpenDialog);
         }
         if ctx.input_mut(|i| i.consume_shortcut(&NEW)) {
@@ -498,6 +573,10 @@ impl eframe::App for App {
                         self.request(Pending::OpenDialog);
                         ui.close_menu();
                     }
+                    if ui.button("Buka Folder… ⇧⌘O").clicked() {
+                        self.open_folder_dialog();
+                        ui.close_menu();
+                    }
                     ui.add_enabled_ui(!self.recent.is_empty(), |ui| {
                         ui.menu_button("Baru dibuka", |ui| {
                             for r in self.recent.clone() {
@@ -525,6 +604,32 @@ impl eframe::App for App {
                 });
             });
         });
+
+        // Explorer folder ala VSCode — panel paling kiri.
+        if let Some(ws) = self.workspace.clone() {
+            egui::SidePanel::left("explorer")
+                .resizable(true)
+                .default_width(210.0)
+                .width_range(150.0..=420.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(
+                            ws.file_name()
+                                .map(|n| n.to_string_lossy().to_uppercase())
+                                .unwrap_or_else(|| "FOLDER".into()),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("✕").on_hover_text("tutup folder").clicked() {
+                                self.workspace = None;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.draw_tree(ui, &ws);
+                    });
+                });
+        }
 
         egui::SidePanel::left("editor")
             .default_width(330.0)
@@ -878,7 +983,7 @@ mod tests {
     use super::*;
 
     fn app() -> App {
-        App::new(CONTOH.to_string(), None, Vec::new())
+        App::new(CONTOH.to_string(), None, Vec::new(), None)
     }
 
     #[test]
