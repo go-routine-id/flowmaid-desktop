@@ -1,0 +1,38 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux system deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/release
+          OS_NAME=$([ "${{ runner.os }}" = "macOS" ] && echo macos || echo linux)
+          tar czf "flowmaid-desktop-${OS_NAME}-$(uname -m).tar.gz" flowmaid-desktop
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target/release/flowmaid-desktop.exe -DestinationPath target/release/flowmaid-desktop-windows-x86_64.zip
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/*.tar.gz
+            target/release/*.zip

@@ -12,7 +12,13 @@ Interactive desktop diagram editor built on the [flowmaid](https://crates.io/cra
 - **Real file workflow** — File menu with New / Open… / recent files / Save / Save As… (⌘N ⌘O ⌘S ⇧⌘S), a dirty indicator in the window title, and a save-first confirmation before anything discards unsaved changes. Files also open via drag & drop or a command-line path.
 - **Auto re-layout** restores the engine layout; **Export SVG…** saves the current arrangement, drags included.
 
-## Running
+## Download
+
+Prebuilt binaries for **macOS / Linux / Windows** are on the [Releases page](https://github.com/go-routine-id/flowmaid-desktop/releases) — no Rust toolchain needed. macOS builds are unsigned for now: first launch via right-click → Open, or `xattr -d com.apple.quarantine flowmaid-desktop`.
+
+The version number tracks the bundled flowmaid engine (desktop v0.6.x runs engine 0.6.x).
+
+## Running from source
 
 ```bash
 cargo run --release              # needs Rust >= 1.85 (eframe dependency)
