@@ -1,10 +1,11 @@
 //! flowmaid desktop — editor diagram interaktif di atas engine flowmaid.
 //!
 //! - Panel kiri : explorer folder ala VSCode (klik file .mmd untuk buka)
-//! - Area utama : tab Preview | Code
-//!     - Preview: kanvas — node bisa DIGESER, edge mengikuti realtime,
+//! - Area utama : tab Preview | Split | Code
+//!     - Preview: kanvas penuh — node bisa DIGESER, edge realtime,
 //!       zoom (pinch / ctrl+scroll / tombol ±) dan pan (scroll / drag)
-//!     - Code   : editor teks Mermaid, live dengan pola "last good render"
+//!     - Split  : kanvas + editor teks berdampingan (default)
+//!     - Code   : editor teks Mermaid penuh, pola "last good render"
 //! - Mendukung flowchart DAN erDiagram (tabel entitas + crow's foot)
 //! - Drag & drop file .mmd ke jendela untuk membukanya; Ekspor SVG
 //!
@@ -97,7 +98,12 @@ fn main() -> eframe::Result<()> {
             let recent: Vec<String> = cc
                 .storage
                 .and_then(|s| s.get_string("recent"))
-                .map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+                .map(|s| {
+                    s.lines()
+                        .filter(|l| !l.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
                 .unwrap_or_default();
             let workspace = cc
                 .storage
@@ -117,10 +123,11 @@ enum Pending {
     OpenPath(PathBuf),
 }
 
-/// Tab area utama: pratinjau diagram atau editor teks.
+/// Tab area utama: pratinjau, terbelah, atau editor teks.
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Preview,
+    Split,
     Code,
 }
 
@@ -151,14 +158,14 @@ struct App {
     // menyentuh filesystem tiap frame. Ok(entries) sudah ter-filter
     // & terurut; Err = pesan gagal baca (mis. folder tercabut).
     dir_cache: HashMap<PathBuf, Result<Vec<PathBuf>, String>>,
-    view: View, // tab aktif: Preview / Code
+    view: View,               // tab aktif: Preview / Code
     pending: Option<Pending>, // aksi menunggu konfirmasi buang-perubahan
     last_title: String,
-    model: Model, // dokumen valid terakhir
-    pos: Vec<(f64, f64)>,        // posisi node/entitas, milik aplikasi (bisa digeser)
-    scn: Scene,                  // geometri terkini untuk digambar
-    tables: Vec<ErTable>,        // data tabel ER (kosong untuk flowchart)
-    cards: Vec<(Card, Card)>,    // kardinalitas per relasi ER, sejajar scn.edges
+    model: Model,             // dokumen valid terakhir
+    pos: Vec<(f64, f64)>,     // posisi node/entitas, milik aplikasi (bisa digeser)
+    scn: Scene,               // geometri terkini untuk digambar
+    tables: Vec<ErTable>,     // data tabel ER (kosong untuk flowchart)
+    cards: Vec<(Card, Card)>, // kardinalitas per relasi ER, sejajar scn.edges
     error: Option<String>,
     status: String,
     zoom: f32,         // faktor zoom kanvas (1.0 = 100%)
@@ -181,7 +188,7 @@ impl App {
             recent,
             workspace,
             dir_cache: HashMap::new(),
-            view: View::Code,
+            view: View::Split,
             pending: None,
             last_title: String::new(),
             model: Model::Flow(Graph::default()),
@@ -239,10 +246,8 @@ impl App {
                             .iter()
                             .enumerate()
                             .map(|(i, e)| {
-                                *old.get(e.name.as_str()).unwrap_or(&(
-                                    auto.scene.nodes[i].x,
-                                    auto.scene.nodes[i].y,
-                                ))
+                                *old.get(e.name.as_str())
+                                    .unwrap_or(&(auto.scene.nodes[i].x, auto.scene.nodes[i].y))
                             })
                             .collect();
                         self.model = Model::Er(d);
@@ -444,37 +449,35 @@ impl App {
                 .map(|m| m.file_type().is_symlink())
                 .unwrap_or(false)
         };
-        let result = std::fs::read_dir(dir)
-            .map_err(|e| e.to_string())
-            .map(|rd| {
-                let mut v: Vec<PathBuf> = rd
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        let name = p
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        if name.starts_with('.') || name == "target" {
-                            return false;
-                        }
-                        let lower = name.to_lowercase();
-                        // Folder asli (bukan symlink) atau file diagram.
-                        (p.is_dir() && !is_symlink(p))
-                            || lower.ends_with(".mmd")
-                            || lower.ends_with(".txt")
-                    })
-                    .collect();
-                v.sort_by_key(|p| {
-                    (
-                        !p.is_dir(),
-                        p.file_name()
-                            .map(|n| n.to_string_lossy().to_lowercase())
-                            .unwrap_or_default(),
-                    )
-                });
-                v
+        let result = std::fs::read_dir(dir).map_err(|e| e.to_string()).map(|rd| {
+            let mut v: Vec<PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    let name = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if name.starts_with('.') || name == "target" {
+                        return false;
+                    }
+                    let lower = name.to_lowercase();
+                    // Folder asli (bukan symlink) atau file diagram.
+                    (p.is_dir() && !is_symlink(p))
+                        || lower.ends_with(".mmd")
+                        || lower.ends_with(".txt")
+                })
+                .collect();
+            v.sort_by_key(|p| {
+                (
+                    !p.is_dir(),
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().to_lowercase())
+                        .unwrap_or_default(),
+                )
             });
+            v
+        });
         self.dir_cache.insert(dir.to_path_buf(), result.clone());
         result
     }
@@ -504,11 +507,7 @@ impl App {
                     .show(ui, |ui| self.draw_tree(ui, &p));
             } else {
                 let selected = self.path.as_deref() == Some(p.as_path());
-                if ui
-                    .selectable_label(selected, format!("▤ {name}"))
-                    .clicked()
-                    && !selected
-                {
+                if ui.selectable_label(selected, format!("▤ {name}")).clicked() && !selected {
                     self.request(Pending::OpenPath(p.clone()));
                 }
             }
@@ -597,7 +596,9 @@ impl eframe::App for App {
             if dropped.len() > 1 {
                 self.status = format!(
                     "membuka {}; {} file lain diabaikan",
-                    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
                     dropped.len() - 1
                 );
             }
@@ -732,15 +733,20 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.view, View::Preview, "◇ Preview");
+                ui.selectable_value(&mut self.view, View::Split, "▥ Split");
                 ui.selectable_value(&mut self.view, View::Code, "‹ › Code");
                 ui.separator();
-                if ui.button("Tata ulang").on_hover_text("tata letak otomatis").clicked() {
+                if ui
+                    .button("Tata ulang")
+                    .on_hover_text("tata letak otomatis")
+                    .clicked()
+                {
                     self.autolayout();
                 }
                 if ui.button("Ekspor SVG").clicked() {
                     self.export_svg_file();
                 }
-                if self.view == View::Preview {
+                if self.view != View::Code {
                     ui.separator();
                     if ui.small_button("−").clicked() {
                         self.zoom_around(1.0 / 1.25, self.canvas_size / 2.0);
@@ -757,168 +763,200 @@ impl eframe::App for App {
                     }
                 }
                 // Status / error parse di ujung kanan.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    match &self.error {
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| match &self.error {
                         Some(e) => {
                             ui.colored_label(Color32::from_rgb(200, 60, 60), format!("parse: {e}"));
                         }
                         None => {
                             ui.label(&self.status);
                         }
-                    }
-                });
+                    },
+                );
             });
         });
 
-        // Tab Code: editor teks penuh.
-        if self.view == View::Code {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let r = ui.add(
-                        egui::TextEdit::multiline(&mut self.src)
-                            .code_editor()
-                            .desired_rows(30)
-                            .desired_width(f32::INFINITY),
-                    );
-                    if r.changed() {
-                        self.reparse();
-                    }
-                });
-            });
-            // Judul jendela dihitung di akhir walau tab Code aktif.
-            self.sync_title(ctx);
-            return;
+        // Area utama sesuai mode aktif.
+        match self.view {
+            View::Code => {
+                egui::CentralPanel::default().show(ctx, |ui| self.draw_editor(ui));
+            }
+            View::Split => {
+                egui::SidePanel::right("code")
+                    .resizable(true)
+                    .default_width(400.0)
+                    .width_range(240.0..=900.0)
+                    .show(ctx, |ui| self.draw_editor(ui));
+                egui::CentralPanel::default().show(ctx, |ui| self.draw_canvas(ui));
+            }
+            View::Preview => {
+                egui::CentralPanel::default().show(ctx, |ui| self.draw_canvas(ui));
+            }
         }
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let canvas = ui.max_rect();
-            self.canvas_size = canvas.size();
-
-            // 0) Input kanvas: drag area kosong / scroll = pan,
-            //    pinch / ctrl+scroll = zoom berjangkar di kursor.
-            //    Didaftarkan SEBELUM node agar node menang saat tumpang tindih.
-            let bg = ui.interact(canvas, egui::Id::new("flowrs-canvas"), Sense::drag());
-            if bg.dragged() {
-                self.pan += bg.drag_delta();
-                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
-            }
-            if ui.rect_contains_pointer(canvas) {
-                let (zd, scroll, mouse) =
-                    ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta, i.pointer.hover_pos()));
-                self.pan += scroll;
-                if zd != 1.0 {
-                    let anchor = mouse.map_or(self.canvas_size / 2.0, |m| m - canvas.min);
-                    self.zoom_around(zd, anchor);
-                }
-            }
-            let (zoom, pan) = (self.zoom, self.pan);
-            // Koordinat dunia (scene) -> layar.
-            let ts = |x: f64, y: f64| canvas.min + pan + Vec2::new(x as f32, y as f32) * zoom;
-
-            // 1) Interaksi drag NODE dulu (rect dalam koordinat layar).
-            let rects: Vec<Rect> = self
-                .scn
-                .nodes
-                .iter()
-                .map(|n| {
-                    Rect::from_center_size(ts(n.x, n.y), Vec2::new(n.w as f32, n.h as f32) * zoom)
-                })
-                .collect();
-            let mut moved = false;
-            let mut hovered_node: Option<usize> = None;
-            for (i, rect) in rects.iter().enumerate() {
-                let resp = ui.interact(*rect, egui::Id::new(("flowrs-node", i)), Sense::drag());
-                if resp.hovered() || resp.dragged() {
-                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
-                    hovered_node = Some(i);
-                }
-                if resp.dragged() {
-                    let d = resp.drag_delta() / zoom; // delta layar -> dunia
-                    self.pos[i].0 += d.x as f64;
-                    self.pos[i].1 += d.y as f64;
-                    moved = true;
-                }
-            }
-            if moved {
-                self.reroute();
-            }
-
-            // 2) Gambar cluster subgraph (terluar dulu), lalu edge,
-            //    lalu node/tabel.
-            let painter = ui.painter();
-            for c in &self.scn.clusters {
-                let tl = ts(c.x, c.y);
-                let rect = Rect::from_min_size(tl, Vec2::new(c.w as f32, c.h as f32) * zoom);
-                painter.rect(
-                    rect,
-                    8.0 * zoom,
-                    Color32::from_rgb(0xf7, 0xf8, 0xfd),
-                    Stroke::new(1.4 * zoom, Color32::from_rgb(0xc9, 0xcf, 0xe8)),
-                );
-                painter.text(
-                    tl + Vec2::new(10.0, 11.0) * zoom,
-                    Align2::LEFT_CENTER,
-                    &c.title,
-                    // Jaga agar judul tetap terbaca saat zoom kecil.
-                    FontId::proportional((12.0 * zoom).max(6.0)),
-                    TYPE_MUTED,
-                );
-            }
-            let is_er = !self.tables.is_empty();
-            for (i, e) in self.scn.edges.iter().enumerate() {
-                if matches!(e.kind, EdgeKind::Invisible) {
-                    continue; // link penata layout — tidak digambar
-                }
-                let p = e.bezier.map(|(x, y)| ts(x, y));
-                let sw = (if matches!(e.kind, EdgeKind::Thick | EdgeKind::ThickOpen) {
-                    3.4
-                } else {
-                    1.7
-                }) * zoom;
-                let stroke = Stroke::new(sw, EDGE);
-                if matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen) {
-                    dashed_bezier(painter, p, stroke);
-                } else {
-                    painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
-                        p,
-                        false,
-                        Color32::TRANSPARENT,
-                        stroke,
-                    ));
-                }
-                if let Some(&(cf, ct)) = self.cards.get(i).filter(|_| is_er) {
-                    // Notasi crow's foot di kedua ujung relasi ER.
-                    // `.get` (bukan index) menjaga andai suatu saat
-                    // jumlah edge dan cards tak sejajar.
-                    draw_glyph(painter, &er::glyph(e.bezier[0], e.bezier[1], cf), &ts, zoom);
-                    draw_glyph(painter, &er::glyph(e.bezier[3], e.bezier[2], ct), &ts, zoom);
-                } else if !is_er && e.kind.has_arrow() {
-                    arrow_head(painter, p, EDGE, zoom);
-                }
-                if let Some((t, (lx, ly), lw)) = &e.label {
-                    let c = ts(*lx, *ly);
-                    let r = Rect::from_center_size(c, Vec2::new(*lw as f32, 20.0) * zoom);
-                    painter.rect(r, 4.0 * zoom, Color32::WHITE, Stroke::new(1.0 * zoom, LABEL_BORDER));
-                    painter.text(c, Align2::CENTER_CENTER, t, FontId::proportional(13.0 * zoom), TEXT);
-                }
-            }
-            if is_er {
-                for (i, (n, t)) in self.scn.nodes.iter().zip(&self.tables).enumerate() {
-                    let accent = hex(flowmaid::style::accent(i));
-                    draw_table(painter, n, t, ts(n.x, n.y), zoom, accent, hovered_node == Some(i));
-                }
-            } else {
-                for (i, n) in self.scn.nodes.iter().enumerate() {
-                    draw_node(painter, n, ts(n.x, n.y), zoom, hovered_node == Some(i));
-                }
-            }
-        });
 
         self.sync_title(ctx);
     }
 }
 
 impl App {
+    /// Editor teks Mermaid (tab Code / sisi Split).
+    fn draw_editor(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let r = ui.add(
+                egui::TextEdit::multiline(&mut self.src)
+                    .code_editor()
+                    .desired_rows(30)
+                    .desired_width(f32::INFINITY),
+            );
+            if r.changed() {
+                self.reparse();
+            }
+        });
+    }
+
+    /// Kanvas diagram interaktif (tab Preview / sisi Split).
+    fn draw_canvas(&mut self, ui: &mut egui::Ui) {
+        let canvas = ui.max_rect();
+        self.canvas_size = canvas.size();
+
+        // 0) Input kanvas: drag area kosong / scroll = pan,
+        //    pinch / ctrl+scroll = zoom berjangkar di kursor.
+        //    Didaftarkan SEBELUM node agar node menang saat tumpang tindih.
+        let bg = ui.interact(canvas, egui::Id::new("flowrs-canvas"), Sense::drag());
+        if bg.dragged() {
+            self.pan += bg.drag_delta();
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
+        }
+        if ui.rect_contains_pointer(canvas) {
+            let (zd, scroll, mouse) =
+                ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta, i.pointer.hover_pos()));
+            self.pan += scroll;
+            if zd != 1.0 {
+                let anchor = mouse.map_or(self.canvas_size / 2.0, |m| m - canvas.min);
+                self.zoom_around(zd, anchor);
+            }
+        }
+        let (zoom, pan) = (self.zoom, self.pan);
+        // Koordinat dunia (scene) -> layar.
+        let ts = |x: f64, y: f64| canvas.min + pan + Vec2::new(x as f32, y as f32) * zoom;
+
+        // 1) Interaksi drag NODE dulu (rect dalam koordinat layar).
+        let rects: Vec<Rect> = self
+            .scn
+            .nodes
+            .iter()
+            .map(|n| Rect::from_center_size(ts(n.x, n.y), Vec2::new(n.w as f32, n.h as f32) * zoom))
+            .collect();
+        let mut moved = false;
+        let mut hovered_node: Option<usize> = None;
+        for (i, rect) in rects.iter().enumerate() {
+            let resp = ui.interact(*rect, egui::Id::new(("flowrs-node", i)), Sense::drag());
+            if resp.hovered() || resp.dragged() {
+                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
+                hovered_node = Some(i);
+            }
+            if resp.dragged() {
+                let d = resp.drag_delta() / zoom; // delta layar -> dunia
+                self.pos[i].0 += d.x as f64;
+                self.pos[i].1 += d.y as f64;
+                moved = true;
+            }
+        }
+        if moved {
+            self.reroute();
+        }
+
+        // 2) Gambar cluster subgraph (terluar dulu), lalu edge,
+        //    lalu node/tabel.
+        let painter = ui.painter();
+        for c in &self.scn.clusters {
+            let tl = ts(c.x, c.y);
+            let rect = Rect::from_min_size(tl, Vec2::new(c.w as f32, c.h as f32) * zoom);
+            painter.rect(
+                rect,
+                8.0 * zoom,
+                Color32::from_rgb(0xf7, 0xf8, 0xfd),
+                Stroke::new(1.4 * zoom, Color32::from_rgb(0xc9, 0xcf, 0xe8)),
+            );
+            painter.text(
+                tl + Vec2::new(10.0, 11.0) * zoom,
+                Align2::LEFT_CENTER,
+                &c.title,
+                // Jaga agar judul tetap terbaca saat zoom kecil.
+                FontId::proportional((12.0 * zoom).max(6.0)),
+                TYPE_MUTED,
+            );
+        }
+        let is_er = !self.tables.is_empty();
+        for (i, e) in self.scn.edges.iter().enumerate() {
+            if matches!(e.kind, EdgeKind::Invisible) {
+                continue; // link penata layout — tidak digambar
+            }
+            let p = e.bezier.map(|(x, y)| ts(x, y));
+            let sw = (if matches!(e.kind, EdgeKind::Thick | EdgeKind::ThickOpen) {
+                3.4
+            } else {
+                1.7
+            }) * zoom;
+            let stroke = Stroke::new(sw, EDGE);
+            if matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen) {
+                dashed_bezier(painter, p, stroke);
+            } else {
+                painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                    p,
+                    false,
+                    Color32::TRANSPARENT,
+                    stroke,
+                ));
+            }
+            if let Some(&(cf, ct)) = self.cards.get(i).filter(|_| is_er) {
+                // Notasi crow's foot di kedua ujung relasi ER.
+                // `.get` (bukan index) menjaga andai suatu saat
+                // jumlah edge dan cards tak sejajar.
+                draw_glyph(painter, &er::glyph(e.bezier[0], e.bezier[1], cf), &ts, zoom);
+                draw_glyph(painter, &er::glyph(e.bezier[3], e.bezier[2], ct), &ts, zoom);
+            } else if !is_er && e.kind.has_arrow() {
+                arrow_head(painter, p, EDGE, zoom);
+            }
+            if let Some((t, (lx, ly), lw)) = &e.label {
+                let c = ts(*lx, *ly);
+                let r = Rect::from_center_size(c, Vec2::new(*lw as f32, 20.0) * zoom);
+                painter.rect(
+                    r,
+                    4.0 * zoom,
+                    Color32::WHITE,
+                    Stroke::new(1.0 * zoom, LABEL_BORDER),
+                );
+                painter.text(
+                    c,
+                    Align2::CENTER_CENTER,
+                    t,
+                    FontId::proportional(13.0 * zoom),
+                    TEXT,
+                );
+            }
+        }
+        if is_er {
+            for (i, (n, t)) in self.scn.nodes.iter().zip(&self.tables).enumerate() {
+                let accent = hex(flowmaid::style::accent(i));
+                draw_table(
+                    painter,
+                    n,
+                    t,
+                    ts(n.x, n.y),
+                    zoom,
+                    accent,
+                    hovered_node == Some(i),
+                );
+            }
+        } else {
+            for (i, n) in self.scn.nodes.iter().enumerate() {
+                draw_node(painter, n, ts(n.x, n.y), zoom, hovered_node == Some(i));
+            }
+        }
+    }
+
     /// Judul jendela dihitung di AKHIR frame — setelah semua mutasi
     /// state — supaya indikator dirty tidak telat satu frame sesudah
     /// ⌘S (ditemukan bughunter). Hanya mengirim perintah saat berubah.
@@ -1097,8 +1135,14 @@ fn dashed_bezier(p: &egui::Painter, b: [Pos2; 4], stroke: Stroke) {
     let f = |t: f32| {
         let u = 1.0 - t;
         Pos2::new(
-            u * u * u * b[0].x + 3.0 * u * u * t * b[1].x + 3.0 * u * t * t * b[2].x + t * t * t * b[3].x,
-            u * u * u * b[0].y + 3.0 * u * u * t * b[1].y + 3.0 * u * t * t * b[2].y + t * t * t * b[3].y,
+            u * u * u * b[0].x
+                + 3.0 * u * u * t * b[1].x
+                + 3.0 * u * t * t * b[2].x
+                + t * t * t * b[3].x,
+            u * u * u * b[0].y
+                + 3.0 * u * u * t * b[1].y
+                + 3.0 * u * t * t * b[2].y
+                + t * t * t * b[3].y,
         )
     };
     let n = 36;
@@ -1202,6 +1246,10 @@ mod tests {
         a.pos[0] = (before.0 + 300.0, before.1);
         a.src = "erDiagram\nusers ||--o{ posts : writes\nposts }o--|| tags : has".into();
         a.reparse();
-        assert_eq!(a.pos[0], (before.0 + 300.0, before.1), "users keeps its dragged spot");
+        assert_eq!(
+            a.pos[0],
+            (before.0 + 300.0, before.1),
+            "users keeps its dragged spot"
+        );
     }
 }
