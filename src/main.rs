@@ -24,19 +24,50 @@ const TEXT: Color32 = Color32::from_rgb(0x23, 0x28, 0x40);
 const LABEL_BORDER: Color32 = Color32::from_rgb(0xd5, 0xd9, 0xec);
 const TYPE_MUTED: Color32 = Color32::from_rgb(0x6a, 0x70, 0x86);
 
-/// `#rrggbb` (tema engine) → Color32, supaya kanvas dan ekspor SVG
-/// memakai warna yang persis sama.
+/// Warna CSS (tema engine / style user) → Color32, supaya kanvas
+/// dan ekspor SVG memakai warna yang persis sama. Mendukung
+/// `#rrggbb`, shorthand `#rgb`, dan nama warna CSS yang umum —
+/// semuanya bentuk yang diterima renderer SVG.
 fn hex(c: &str) -> Color32 {
-    if c.len() == 7 && c.starts_with('#') {
-        if let (Ok(r), Ok(g), Ok(b)) = (
-            u8::from_str_radix(&c[1..3], 16),
-            u8::from_str_radix(&c[3..5], 16),
-            u8::from_str_radix(&c[5..7], 16),
-        ) {
+    let c = c.trim();
+    if let Some(h) = c.strip_prefix('#') {
+        let expand = |s: &str| -> Option<(u8, u8, u8)> {
+            Some((
+                u8::from_str_radix(&s[0..2], 16).ok()?,
+                u8::from_str_radix(&s[2..4], 16).ok()?,
+                u8::from_str_radix(&s[4..6], 16).ok()?,
+            ))
+        };
+        let rgb = match h.len() {
+            6 if h.is_ascii() => expand(h),
+            // #f9f → #ff99ff, persis aturan CSS.
+            3 if h.is_ascii() => {
+                let d: Vec<String> = h.chars().map(|ch| format!("{ch}{ch}")).collect();
+                expand(&d.concat())
+            }
+            _ => None,
+        };
+        if let Some((r, g, b)) = rgb {
             return Color32::from_rgb(r, g, b);
         }
     }
-    Color32::GRAY
+    // Nama warna CSS dasar yang lazim dipakai di diagram mermaid.
+    match c.to_ascii_lowercase().as_str() {
+        "black" => Color32::from_rgb(0, 0, 0),
+        "white" => Color32::from_rgb(255, 255, 255),
+        "red" => Color32::from_rgb(255, 0, 0),
+        "green" => Color32::from_rgb(0, 128, 0),
+        "blue" => Color32::from_rgb(0, 0, 255),
+        "yellow" => Color32::from_rgb(255, 255, 0),
+        "orange" => Color32::from_rgb(255, 165, 0),
+        "purple" => Color32::from_rgb(128, 0, 128),
+        "pink" => Color32::from_rgb(255, 192, 203),
+        "teal" => Color32::from_rgb(0, 128, 128),
+        "cyan" => Color32::from_rgb(0, 255, 255),
+        "brown" => Color32::from_rgb(165, 42, 42),
+        "lightgray" | "lightgrey" => Color32::from_rgb(211, 211, 211),
+        _ => Color32::GRAY,
+    }
 }
 
 const MIN_ZOOM: f32 = 0.2;
@@ -848,6 +879,17 @@ mod tests {
 
     fn app() -> App {
         App::new(CONTOH.to_string(), None, Vec::new())
+    }
+
+    #[test]
+    fn hex_handles_css_forms_like_the_svg_renderer() {
+        // Bug ditemukan bughunter: #f9f dulu jatuh ke GRAY di kanvas
+        // padahal ekspor SVG merendernya magenta.
+        assert_eq!(hex("#f9f"), Color32::from_rgb(0xff, 0x99, 0xff));
+        assert_eq!(hex("#ff99ff"), Color32::from_rgb(0xff, 0x99, 0xff));
+        assert_eq!(hex("red"), Color32::from_rgb(255, 0, 0));
+        assert_eq!(hex(" #333 "), Color32::from_rgb(0x33, 0x33, 0x33));
+        assert_eq!(hex("bukanwarna"), Color32::GRAY);
     }
 
     #[test]
