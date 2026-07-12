@@ -1121,9 +1121,9 @@ dependencies = [
 
 [[package]]
 name = "flowmaid"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1f37e23dc5304adea6ffd75a7127c657b8b53b2ef900747b8b206fc545adf5f"
+checksum = "0eebb687ff6592bb864a2ed9a580a7aeab06ae100bcd81e620a9f7c153317ae6"
 
 [[package]]
 name = "flowmaid-desktop"

@@ -6,15 +6,17 @@
 //!       zoom (pinch / ctrl+scroll / tombol ±) dan pan (scroll / drag)
 //!     - Split  : kanvas + editor teks berdampingan (default)
 //!     - Code   : editor teks Mermaid penuh, pola "last good render"
-//! - Mendukung flowchart DAN erDiagram (tabel entitas + crow's foot)
+//! - Mendukung flowchart, erDiagram (tabel entitas + crow's foot),
+//!   dan classDiagram (box tiga kompartemen + glyph relasi UML)
 //! - Drag & drop file .mmd ke jendela untuk membukanya; Ekspor SVG
 //!
 //! Jalankan: `cargo run --release` (engine `flowmaid` ditarik
 //! langsung dari crates.io).
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
+use flowmaid::class::{self, ClassBox, RelStyle};
 use flowmaid::er::{self, ErTable};
-use flowmaid::model::{Card, EdgeKind, ErDiagram, Graph, Shape};
+use flowmaid::model::{Card, ClassDiagram, EdgeKind, ErDiagram, Graph, Shape};
 use flowmaid::scene::{route, scene, to_svg, Scene, SceneNode};
 use flowmaid::Document;
 use std::collections::HashMap;
@@ -131,19 +133,21 @@ enum View {
     Code,
 }
 
-/// Dokumen valid terakhir — flowchart atau diagram ER.
+/// Dokumen valid terakhir — flowchart, diagram ER, atau class.
 enum Model {
     Flow(Graph),
     Er(ErDiagram),
+    Class(ClassDiagram),
 }
 
 impl Model {
-    /// Kunci identitas node/entitas ke-i, untuk mempertahankan
+    /// Kunci identitas node/entitas/class ke-i, untuk mempertahankan
     /// posisi geseran saat teks diedit.
     fn keys(&self) -> Vec<&str> {
         match self {
             Model::Flow(g) => g.nodes.iter().map(|n| n.id.as_str()).collect(),
             Model::Er(d) => d.entities.iter().map(|e| e.name.as_str()).collect(),
+            Model::Class(d) => d.classes.iter().map(|c| c.name.as_str()).collect(),
         }
     }
 }
@@ -166,6 +170,8 @@ struct App {
     scn: Scene,               // geometri terkini untuk digambar
     tables: Vec<ErTable>,     // data tabel ER (kosong untuk flowchart)
     cards: Vec<(Card, Card)>, // kardinalitas per relasi ER, sejajar scn.edges
+    boxes: Vec<ClassBox>,     // data box class (kosong untuk non-class)
+    rels: Vec<RelStyle>,      // gaya/kardinalitas relasi class, sejajar scn.edges
     error: Option<String>,
     status: String,
     zoom: f32,         // faktor zoom kanvas (1.0 = 100%)
@@ -202,6 +208,8 @@ impl App {
             },
             tables: Vec::new(),
             cards: Vec::new(),
+            boxes: Vec::new(),
+            rels: Vec::new(),
             error: None,
             status: "geser node dengan mouse".into(),
             zoom: 1.0,
@@ -252,6 +260,19 @@ impl App {
                             .collect();
                         self.model = Model::Er(d);
                     }
+                    Document::Class(d) => {
+                        let auto = class::scene(&d);
+                        self.pos = d
+                            .classes
+                            .iter()
+                            .enumerate()
+                            .map(|(i, c)| {
+                                *old.get(c.name.as_str())
+                                    .unwrap_or(&(auto.scene.nodes[i].x, auto.scene.nodes[i].y))
+                            })
+                            .collect();
+                        self.model = Model::Class(d);
+                    }
                 }
                 self.reroute();
                 self.error = None;
@@ -261,38 +282,53 @@ impl App {
     }
 
     fn reroute(&mut self) {
+        self.clear_aux();
         match &self.model {
-            Model::Flow(g) => {
-                self.scn = route(g, &self.pos);
-                self.tables.clear();
-                self.cards.clear();
-            }
+            Model::Flow(g) => self.scn = route(g, &self.pos),
             Model::Er(d) => {
                 let es = er::route(d, &self.pos);
                 self.scn = es.scene;
                 self.tables = es.tables;
                 self.cards = es.cards;
             }
+            Model::Class(d) => {
+                let cs = class::route(d, &self.pos);
+                self.scn = cs.scene;
+                self.boxes = cs.boxes;
+                self.rels = cs.rels;
+            }
         }
     }
 
     /// Kembali ke tata letak otomatis engine.
     fn autolayout(&mut self) {
+        self.clear_aux();
         match &self.model {
-            Model::Flow(g) => {
-                self.scn = scene(g);
-                self.tables.clear();
-                self.cards.clear();
-            }
+            Model::Flow(g) => self.scn = scene(g),
             Model::Er(d) => {
                 let es = er::scene(d);
                 self.scn = es.scene;
                 self.tables = es.tables;
                 self.cards = es.cards;
             }
+            Model::Class(d) => {
+                let cs = class::scene(d);
+                self.scn = cs.scene;
+                self.boxes = cs.boxes;
+                self.rels = cs.rels;
+            }
         }
         self.pos = self.scn.nodes.iter().map(|n| (n.x, n.y)).collect();
         self.reset_view();
+    }
+
+    /// Kosongkan data gambar khusus-diagram (ER & class); tiap arm
+    /// route/autolayout mengisi ulang miliknya.
+    fn clear_aux(&mut self) {
+        self.tables.clear();
+        self.cards.clear();
+        self.boxes.clear();
+        self.rels.clear();
     }
 
     /// SVG dari susunan saat ini (termasuk hasil geseran).
@@ -300,6 +336,7 @@ impl App {
         match &self.model {
             Model::Flow(_) => to_svg(&self.scn),
             Model::Er(d) => er::to_svg(&er::route(d, &self.pos)),
+            Model::Class(d) => class::to_svg(&class::route(d, &self.pos)),
         }
     }
 
@@ -902,6 +939,7 @@ impl App {
             );
         }
         let is_er = !self.tables.is_empty();
+        let is_class = !self.boxes.is_empty();
         for (i, e) in self.scn.edges.iter().enumerate() {
             if matches!(e.kind, EdgeKind::Invisible) {
                 continue; // link penata layout — tidak digambar
@@ -923,13 +961,30 @@ impl App {
                     stroke,
                 ));
             }
-            if let Some(&(cf, ct)) = self.cards.get(i).filter(|_| is_er) {
+            if is_class {
+                // Glyph UML di ujung `to`; kardinalitas di kedua sisi.
+                // `.get` menjaga andai edge & rels tak sejajar.
+                if let Some(rel) = self.rels.get(i) {
+                    draw_head(
+                        painter,
+                        &class::head(e.bezier[3], e.bezier[2], rel.kind),
+                        &ts,
+                        zoom,
+                    );
+                    if let Some(c) = &rel.from_card {
+                        draw_card(painter, e.bezier[0], e.bezier[1], c, &ts, zoom);
+                    }
+                    if let Some(c) = &rel.to_card {
+                        draw_card(painter, e.bezier[3], e.bezier[2], c, &ts, zoom);
+                    }
+                }
+            } else if let Some(&(cf, ct)) = self.cards.get(i).filter(|_| is_er) {
                 // Notasi crow's foot di kedua ujung relasi ER.
                 // `.get` (bukan index) menjaga andai suatu saat
                 // jumlah edge dan cards tak sejajar.
                 draw_glyph(painter, &er::glyph(e.bezier[0], e.bezier[1], cf), &ts, zoom);
                 draw_glyph(painter, &er::glyph(e.bezier[3], e.bezier[2], ct), &ts, zoom);
-            } else if !is_er && e.kind.has_arrow() {
+            } else if e.kind.has_arrow() {
                 arrow_head(painter, p, EDGE, zoom);
             }
             if let Some((t, (lx, ly), lw)) = &e.label {
@@ -950,7 +1005,12 @@ impl App {
                 );
             }
         }
-        if is_er {
+        if is_class {
+            for (i, (n, b)) in self.scn.nodes.iter().zip(&self.boxes).enumerate() {
+                let accent = hex(flowmaid::style::accent(i));
+                draw_class_box(painter, n, b, ts(n.x, n.y), zoom, accent, hovered_node == Some(i));
+            }
+        } else if is_er {
             for (i, (n, t)) in self.scn.nodes.iter().zip(&self.tables).enumerate() {
                 let accent = hex(flowmaid::style::accent(i));
                 draw_table(
@@ -1185,6 +1245,117 @@ fn draw_glyph(
     }
 }
 
+/// Box class tiga kompartemen (nama / field / method) — cermin dari
+/// `class::to_svg`, memakai konstanta ukuran engine yang sama.
+#[allow(clippy::too_many_arguments)]
+fn draw_class_box(
+    p: &egui::Painter,
+    n: &SceneNode,
+    b: &ClassBox,
+    c: Pos2,
+    zoom: f32,
+    accent: Color32,
+    hovered: bool,
+) {
+    use flowmaid::class::{ClassRow, EMPTY_H, HEADER_H, PAD, ROW_H};
+    let (w, h) = (n.w as f32 * zoom, n.h as f32 * zoom);
+    let x0 = c.x - w / 2.0;
+    let y0 = c.y - h / 2.0;
+    let round = 4.0 * zoom;
+    p.rect(
+        Rect::from_min_size(Pos2::new(x0, y0), Vec2::new(w, h)),
+        round,
+        Color32::WHITE,
+        Stroke::new(if hovered { 2.8 } else { 1.6 } * zoom, accent),
+    );
+    // Kompartemen nama (header accent, sudut atas membulat).
+    let hh = HEADER_H as f32 * zoom;
+    p.rect(
+        Rect::from_min_size(Pos2::new(x0, y0), Vec2::new(w, hh)),
+        egui::Rounding {
+            nw: round,
+            ne: round,
+            sw: 0.0,
+            se: 0.0,
+        },
+        accent,
+        Stroke::NONE,
+    );
+    p.text(
+        Pos2::new(c.x, y0 + hh / 2.0),
+        Align2::CENTER_CENTER,
+        &b.name,
+        FontId::proportional(13.5 * zoom),
+        Color32::WHITE,
+    );
+    let row_h = ROW_H as f32 * zoom;
+    let font = FontId::proportional(12.5 * zoom);
+    let comp_h =
+        |rows: usize| (if rows == 0 { EMPTY_H as f32 } else { rows as f32 * ROW_H as f32 }) * zoom;
+    // Pemisah + baris kompartemen, mulai dari `top`.
+    let draw_rows = |top: f32, rows: &[ClassRow]| {
+        p.line_segment(
+            [Pos2::new(x0, top), Pos2::new(x0 + w, top)],
+            Stroke::new(1.0 * zoom, LABEL_BORDER),
+        );
+        for (i, row) in rows.iter().enumerate() {
+            let cy = top + i as f32 * row_h + row_h / 2.0;
+            p.text(
+                Pos2::new(x0 + PAD as f32 * zoom, cy),
+                Align2::LEFT_CENTER,
+                &row.text,
+                font.clone(),
+                TEXT,
+            );
+        }
+    };
+    let fields_top = y0 + hh;
+    draw_rows(fields_top, &b.fields);
+    draw_rows(fields_top + comp_h(b.fields.len()), &b.methods);
+}
+
+/// Glyph ujung UML (segitiga/diamond terisi-atau-hollow / panah
+/// terbuka) dalam koordinat dunia, ditransformasikan saat digambar.
+fn draw_head(
+    p: &egui::Painter,
+    h: &class::Head,
+    ts: &impl Fn(f64, f64) -> Pos2,
+    zoom: f32,
+) {
+    let stroke = Stroke::new(1.6 * zoom, EDGE);
+    if !h.polygon.is_empty() {
+        let pts: Vec<Pos2> = h.polygon.iter().map(|(x, y)| ts(*x, *y)).collect();
+        let fill = if h.filled { EDGE } else { Color32::WHITE };
+        p.add(egui::epaint::PathShape::convex_polygon(pts, fill, stroke));
+    }
+    for [a, b] in &h.segments {
+        p.line_segment([ts(a.0, a.1), ts(b.0, b.1)], stroke);
+    }
+}
+
+/// Label kardinalitas class, sedikit ke dalam & menyamping dari ujung.
+fn draw_card(
+    p: &egui::Painter,
+    e: (f64, f64),
+    c: (f64, f64),
+    text: &str,
+    ts: &impl Fn(f64, f64) -> Pos2,
+    zoom: f32,
+) {
+    let (dx, dy) = (c.0 - e.0, c.1 - e.1);
+    let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+    let (ux, uy) = (dx / len, dy / len);
+    let px = e.0 + ux * 14.0 - uy * 9.0;
+    let py = e.1 + uy * 14.0 + ux * 9.0;
+    p.text(
+        ts(px, py),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::proportional(11.0 * zoom),
+        TEXT,
+    );
+}
+
 /// Kepala panah di ujung bezier, searah turunan kurva di t=1.
 fn arrow_head(p: &egui::Painter, b: [Pos2; 4], color: Color32, zoom: f32) {
     let tip = b[3];
@@ -1321,5 +1492,24 @@ mod tests {
             (before.0 + 300.0, before.1),
             "users keeps its dragged spot"
         );
+    }
+
+    #[test]
+    fn reparse_handles_class_model_and_clears_other_aux() {
+        let mut a = app();
+        a.src = "classDiagram\nAnimal <|-- Dog\nAnimal \"1\" o-- \"*\" Toy : owns".into();
+        a.reparse();
+        assert!(matches!(a.model, Model::Class(_)));
+        assert_eq!(a.boxes.len(), 3, "Animal + Dog + Toy");
+        assert_eq!(a.rels.len(), 2);
+        assert!(a.tables.is_empty() && a.cards.is_empty(), "ER aux must be cleared");
+        assert!(a.error.is_none());
+        // Switching back to a flowchart clears the class aux again.
+        a.src = "flowchart TD\nX --> Y".into();
+        a.reparse();
+        assert!(matches!(a.model, Model::Flow(_)));
+        assert!(a.boxes.is_empty() && a.rels.is_empty(), "class aux must be cleared");
+        // Export follows the active model without panicking.
+        assert!(a.export_svg().contains("<svg"));
     }
 }
