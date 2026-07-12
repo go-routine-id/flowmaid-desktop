@@ -507,7 +507,7 @@ impl App {
                     .show(ui, |ui| self.draw_tree(ui, &p));
             } else {
                 let selected = self.path.as_deref() == Some(p.as_path());
-                if ui.selectable_label(selected, format!("▤ {name}")).clicked() && !selected {
+                if ui.selectable_label(selected, &name).clicked() && !selected {
                     self.request(Pending::OpenPath(p.clone()));
                 }
             }
@@ -649,15 +649,15 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Baru        ⌘N").clicked() {
+                    if ui.button("Baru  (Cmd+N)").clicked() {
                         self.request(Pending::New);
                         ui.close_menu();
                     }
-                    if ui.button("Buka…       ⌘O").clicked() {
+                    if ui.button("Buka…  (Cmd+O)").clicked() {
                         self.request(Pending::OpenDialog);
                         ui.close_menu();
                     }
-                    if ui.button("Buka Folder… ⇧⌘O").clicked() {
+                    if ui.button("Buka Folder…  (Shift+Cmd+O)").clicked() {
                         self.open_folder_dialog();
                         ui.close_menu();
                     }
@@ -672,11 +672,11 @@ impl eframe::App for App {
                         });
                     });
                     ui.separator();
-                    if ui.button("Simpan      ⌘S").clicked() {
+                    if ui.button("Simpan  (Cmd+S)").clicked() {
                         self.save_doc();
                         ui.close_menu();
                     }
-                    if ui.button("Simpan Sebagai… ⇧⌘S").clicked() {
+                    if ui.button("Simpan Sebagai…  (Shift+Cmd+S)").clicked() {
                         self.save_as();
                         ui.close_menu();
                     }
@@ -703,11 +703,11 @@ impl eframe::App for App {
                                 .unwrap_or_else(|| "FOLDER".into()),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("✕").on_hover_text("tutup folder").clicked() {
+                            if ui.small_button("tutup").clicked() {
                                 self.workspace = None;
                                 self.dir_cache.clear();
                             }
-                            if ui.small_button("⟳").on_hover_text("segarkan").clicked() {
+                            if ui.small_button("segarkan").clicked() {
                                 self.dir_cache.clear();
                             }
                         });
@@ -721,20 +721,20 @@ impl eframe::App for App {
                     ui.add_space(8.0);
                     ui.label("Belum ada folder terbuka.");
                     ui.add_space(6.0);
-                    if ui.button("📂 Buka Folder…").clicked() {
+                    if ui.button("Buka Folder…").clicked() {
                         self.open_folder_dialog();
                     }
                     ui.add_space(4.0);
-                    ui.small("⇧⌘O — jelajahi file .mmd di sisi kiri.");
+                    ui.small("Shift+Cmd+O untuk menjelajahi file .mmd.");
                 }
             });
 
         // Toolbar: tab Preview | Code di kiri, aksi di kanan.
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.view, View::Preview, "◇ Preview");
-                ui.selectable_value(&mut self.view, View::Split, "▥ Split");
-                ui.selectable_value(&mut self.view, View::Code, "‹ › Code");
+                ui.selectable_value(&mut self.view, View::Preview, "Preview");
+                ui.selectable_value(&mut self.view, View::Split, "Split");
+                ui.selectable_value(&mut self.view, View::Code, "Code");
                 ui.separator();
                 if ui
                     .button("Tata ulang")
@@ -748,7 +748,7 @@ impl eframe::App for App {
                 }
                 if self.view != View::Code {
                     ui.separator();
-                    if ui.small_button("−").clicked() {
+                    if ui.small_button("-").clicked() {
                         self.zoom_around(1.0 / 1.25, self.canvas_size / 2.0);
                     }
                     if ui
