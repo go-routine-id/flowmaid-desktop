@@ -79,7 +79,9 @@ fn main() -> eframe::Result<()> {
     let arg = std::env::args().nth(1).map(PathBuf::from);
     let (src, path) = match arg {
         Some(p) => match std::fs::read_to_string(&p) {
-            Ok(t) => (t, Some(p)),
+            // Canonicalize argumen CLI relatif supaya highlight di
+            // explorer cocok dengan path absolut pohon.
+            Ok(t) => (t, Some(std::fs::canonicalize(&p).unwrap_or(p))),
             Err(_) => (CONTOH.to_string(), None),
         },
         None => (CONTOH.to_string(), None),
@@ -138,6 +140,10 @@ struct App {
     saved_src: String,     // isi terakhir yang tersimpan, untuk deteksi dirty
     recent: Vec<String>,   // file terakhir dibuka, terbaru di depan
     workspace: Option<PathBuf>, // folder explorer ala VSCode (panel kiri)
+    // Cache isi tiap folder yang sudah dibaca — explorer tak lagi
+    // menyentuh filesystem tiap frame. Ok(entries) sudah ter-filter
+    // & terurut; Err = pesan gagal baca (mis. folder tercabut).
+    dir_cache: HashMap<PathBuf, Result<Vec<PathBuf>, String>>,
     pending: Option<Pending>, // aksi menunggu konfirmasi buang-perubahan
     last_title: String,
     model: Model, // dokumen valid terakhir
@@ -166,6 +172,7 @@ impl App {
             saved_src,
             recent,
             workspace,
+            dir_cache: HashMap::new(),
             pending: None,
             last_title: String::new(),
             model: Model::Flow(Graph::default()),
@@ -310,6 +317,9 @@ impl App {
     fn open_path(&mut self, p: PathBuf) {
         match std::fs::read_to_string(&p) {
             Ok(t) => {
+                // Canonicalize agar cocok dengan path pohon explorer
+                // (highlight file aktif); fallback ke path asli.
+                let p = std::fs::canonicalize(&p).unwrap_or(p);
                 self.src = t;
                 self.saved_src = self.src.clone();
                 self.reparse();
@@ -332,14 +342,16 @@ impl App {
     }
 
     /// Simpan ke file saat ini; belum punya file → Simpan Sebagai.
-    fn save_doc(&mut self) {
+    /// Mengembalikan `true` bila dokumen benar-benar tersimpan.
+    fn save_doc(&mut self) -> bool {
         match self.path.clone() {
             Some(p) => self.write_to(&p),
             None => self.save_as(),
         }
     }
 
-    fn save_as(&mut self) {
+    /// `true` bila tersimpan; `false` bila dibatalkan atau gagal tulis.
+    fn save_as(&mut self) -> bool {
         let mut dlg = rfd::FileDialog::new().add_filter("Mermaid", &["mmd"]);
         match &self.path {
             Some(p) => {
@@ -352,20 +364,27 @@ impl App {
             }
             None => dlg = dlg.set_file_name("diagram.mmd"),
         }
-        if let Some(p) = dlg.save_file() {
-            self.write_to(&p);
-            self.push_recent(&p);
-            self.path = Some(p);
+        match dlg.save_file() {
+            Some(p) if self.write_to(&p) => {
+                self.push_recent(&p);
+                self.path = Some(p);
+                true
+            }
+            _ => false,
         }
     }
 
-    fn write_to(&mut self, p: &Path) {
+    fn write_to(&mut self, p: &Path) -> bool {
         match std::fs::write(p, &self.src) {
             Ok(_) => {
                 self.saved_src = self.src.clone();
                 self.status = format!("tersimpan: {}", p.display());
+                true
             }
-            Err(e) => self.status = format!("gagal menyimpan: {}", e),
+            Err(e) => {
+                self.status = format!("gagal menyimpan: {}", e);
+                false
+            }
         }
     }
 
@@ -395,39 +414,86 @@ impl App {
             dlg = dlg.set_directory(ws);
         }
         if let Some(p) = dlg.pick_folder() {
+            // Canonicalize supaya path anak di pohon sejajar dengan
+            // `self.path` (yang juga di-canonicalize) → highlight jalan.
+            let p = std::fs::canonicalize(&p).unwrap_or(p);
             self.status = format!("folder: {}", p.display());
+            self.dir_cache.clear();
             self.workspace = Some(p);
         }
+    }
+
+    /// Isi satu folder (folder-dulu, alfabetis, ter-filter),
+    /// di-cache supaya explorer tak menyentuh filesystem tiap frame.
+    /// Symlink direktori dilewati agar tak ada siklus tak berujung.
+    fn listing(&mut self, dir: &Path) -> Result<Vec<PathBuf>, String> {
+        if let Some(cached) = self.dir_cache.get(dir) {
+            return cached.clone();
+        }
+        let is_symlink = |p: &Path| {
+            std::fs::symlink_metadata(p)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+        };
+        let result = std::fs::read_dir(dir)
+            .map_err(|e| e.to_string())
+            .map(|rd| {
+                let mut v: Vec<PathBuf> = rd
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        let name = p
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        if name.starts_with('.') || name == "target" {
+                            return false;
+                        }
+                        let lower = name.to_lowercase();
+                        // Folder asli (bukan symlink) atau file diagram.
+                        (p.is_dir() && !is_symlink(p))
+                            || lower.ends_with(".mmd")
+                            || lower.ends_with(".txt")
+                    })
+                    .collect();
+                v.sort_by_key(|p| {
+                    (
+                        !p.is_dir(),
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().to_lowercase())
+                            .unwrap_or_default(),
+                    )
+                });
+                v
+            });
+        self.dir_cache.insert(dir.to_path_buf(), result.clone());
+        result
     }
 
     /// Pohon file rekursif untuk explorer: folder bisa dilipat,
     /// file `.mmd`/`.txt` bisa diklik untuk dibuka (lewat penjaga
     /// perubahan-belum-disimpan), file aktif di-highlight.
     fn draw_tree(&mut self, ui: &mut egui::Ui, dir: &Path) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
-        // Folder dulu, lalu file — masing-masing alfabetis.
-        entries.sort_by_key(|p| {
-            (
-                !p.is_dir(),
-                p.file_name()
-                    .map(|n| n.to_string_lossy().to_lowercase())
-                    .unwrap_or_default(),
-            )
-        });
+        let entries = match self.listing(dir) {
+            Ok(v) => v,
+            Err(e) => {
+                ui.colored_label(
+                    Color32::from_rgb(200, 60, 60),
+                    format!("⚠ folder tidak dapat dibaca: {e}"),
+                );
+                return;
+            }
+        };
         for p in entries {
             let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
                 continue;
             };
-            if name.starts_with('.') || name == "target" {
-                continue;
-            }
             if p.is_dir() {
                 egui::CollapsingHeader::new(&name)
                     .id_salt(&p)
                     .default_open(false)
                     .show(ui, |ui| self.draw_tree(ui, &p));
-            } else if name.ends_with(".mmd") || name.ends_with(".txt") {
+            } else {
                 let selected = self.path.as_deref() == Some(p.as_path());
                 if ui
                     .selectable_label(selected, format!("▤ {name}"))
@@ -443,6 +509,13 @@ impl App {
     /// Jalankan aksi yang bisa membuang perubahan; kalau dokumen
     /// dirty, tahan dulu di dialog konfirmasi.
     fn request(&mut self, act: Pending) {
+        // Selagi dialog konfirmasi terbuka, abaikan aksi baru —
+        // kalau tidak, aksi tertunda bisa tertimpa diam-diam dan
+        // tombol "Buang perubahan" membuang aksi yang salah
+        // (ditemukan bughunter).
+        if self.pending.is_some() {
+            return;
+        }
         if self.dirty() {
             self.pending = Some(act);
         } else {
@@ -480,21 +553,6 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Judul jendela: "• nama.mmd — flowmaid desktop" saat dirty.
-        let title = format!(
-            "{}{} — flowmaid desktop",
-            if self.dirty() { "• " } else { "" },
-            self.path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "tanpa judul".into())
-        );
-        if title != self.last_title {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
-            self.last_title = title;
-        }
-
         // Shortcut file. Simpan-Sebagai dicek sebelum Simpan supaya
         // ⇧⌘S tidak termakan ⌘S.
         use egui::{Key, KeyboardShortcut, Modifiers};
@@ -519,9 +577,21 @@ impl eframe::App for App {
             self.request(Pending::New);
         }
 
-        // Drag & drop FILE .mmd ke jendela.
-        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        if let Some(p) = dropped.first().and_then(|f| f.path.clone()) {
+        // Drag & drop FILE .mmd ke jendela. Banyak file sekaligus:
+        // buka yang pertama, beri tahu sisanya diabaikan.
+        let dropped: Vec<PathBuf> = ctx
+            .input(|i| i.raw.dropped_files.clone())
+            .into_iter()
+            .filter_map(|f| f.path)
+            .collect();
+        if let Some(p) = dropped.first().cloned() {
+            if dropped.len() > 1 {
+                self.status = format!(
+                    "membuka {}; {} file lain diabaikan",
+                    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    dropped.len() - 1
+                );
+            }
             self.request(Pending::OpenPath(p));
         }
 
@@ -537,14 +607,12 @@ impl eframe::App for App {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Simpan dulu").clicked() {
-                            self.save_doc();
-                            // Simpan bisa dibatalkan dari dialog Simpan
-                            // Sebagai — lanjut hanya bila benar tersimpan.
-                            decided = if self.dirty() {
-                                Some(None)
-                            } else {
-                                Some(self.pending.take())
-                            };
+                            // Lanjut HANYA bila benar-benar tersimpan.
+                            // Gagal tulis atau Simpan-Sebagai dibatalkan
+                            // → dialog tetap terbuka, aksi tak hilang.
+                            if self.save_doc() {
+                                decided = Some(self.pending.take());
+                            }
                         }
                         if ui.button("Buang perubahan").clicked() {
                             decided = Some(self.pending.take());
@@ -553,6 +621,12 @@ impl eframe::App for App {
                             decided = Some(None);
                         }
                     });
+                    // Tampilkan error simpan DI DALAM dialog, bukan di
+                    // baris status yang tertutup dialog ini.
+                    if self.status.starts_with("gagal") {
+                        ui.add_space(6.0);
+                        ui.colored_label(Color32::from_rgb(200, 60, 60), &self.status);
+                    }
                 });
             match decided {
                 Some(Some(act)) => self.perform(act),
@@ -621,6 +695,10 @@ impl eframe::App for App {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("✕").on_hover_text("tutup folder").clicked() {
                                 self.workspace = None;
+                                self.dir_cache.clear();
+                            }
+                            if ui.small_button("⟳").on_hover_text("segarkan").clicked() {
+                                self.dir_cache.clear();
                             }
                         });
                     });
@@ -750,7 +828,8 @@ impl eframe::App for App {
                     tl + Vec2::new(10.0, 11.0) * zoom,
                     Align2::LEFT_CENTER,
                     &c.title,
-                    FontId::proportional(12.0 * zoom),
+                    // Jaga agar judul tetap terbaca saat zoom kecil.
+                    FontId::proportional((12.0 * zoom).max(6.0)),
                     TYPE_MUTED,
                 );
             }
@@ -776,12 +855,13 @@ impl eframe::App for App {
                         stroke,
                     ));
                 }
-                if is_er {
-                    // Notasi crow's foot di kedua ujung relasi.
-                    let (cf, ct) = self.cards[i];
+                if let Some(&(cf, ct)) = self.cards.get(i).filter(|_| is_er) {
+                    // Notasi crow's foot di kedua ujung relasi ER.
+                    // `.get` (bukan index) menjaga andai suatu saat
+                    // jumlah edge dan cards tak sejajar.
                     draw_glyph(painter, &er::glyph(e.bezier[0], e.bezier[1], cf), &ts, zoom);
                     draw_glyph(painter, &er::glyph(e.bezier[3], e.bezier[2], ct), &ts, zoom);
-                } else if e.kind.has_arrow() {
+                } else if !is_er && e.kind.has_arrow() {
                     arrow_head(painter, p, EDGE, zoom);
                 }
                 if let Some((t, (lx, ly), lw)) = &e.label {
@@ -802,6 +882,23 @@ impl eframe::App for App {
                 }
             }
         });
+
+        // Judul jendela dihitung di AKHIR frame — setelah semua
+        // mutasi state — supaya indikator dirty tidak telat satu
+        // frame sesudah ⌘S (ditemukan bughunter).
+        let title = format!(
+            "{}{} — flowmaid desktop",
+            if self.dirty() { "• " } else { "" },
+            self.path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "tanpa judul".into())
+        );
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
+        }
     }
 }
 
@@ -984,6 +1081,23 @@ mod tests {
 
     fn app() -> App {
         App::new(CONTOH.to_string(), None, Vec::new(), None)
+    }
+
+    #[test]
+    fn write_to_reports_success_and_failure() {
+        let mut a = app();
+        let dir = std::env::temp_dir().join(format!("flowmaid-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("out.mmd");
+        assert!(a.write_to(&f), "write to a real path must succeed");
+        assert!(!a.dirty(), "successful save clears dirty");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), a.src);
+        // A path whose parent is a file (not a dir) can't be written.
+        let bad = f.join("nested.mmd");
+        a.src.push_str("\nX-->Y");
+        assert!(!a.write_to(&bad), "write to an invalid path must fail");
+        assert!(a.dirty(), "failed save leaves the doc dirty");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
