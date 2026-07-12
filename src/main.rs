@@ -42,7 +42,7 @@ fn hex(c: &str) -> Color32 {
 const MIN_ZOOM: f32 = 0.2;
 const MAX_ZOOM: f32 = 4.0;
 
-const CONTOH: &str = "%% Geser node dengan mouse, atau edit teks ini.\nflowchart TD\n    A([Mulai]) --> B[Baca input]\n    B --> C{Valid?}\n    C -->|ya| D[Proses data]\n    C -->|tidak| E[Tampilkan error]\n    E --> B\n    D ==> F((Selesai))\n";
+const CONTOH: &str = "%% Geser node dengan mouse, atau edit teks ini.\n%% Warna kustom: style / classDef / ::: ala mermaid.\nflowchart TD\n    A([Mulai]) --> B[Baca input]\n    B --> C{Valid?}\n    C -->|ya| D[Proses data]\n    C -->|tidak| E[Tampilkan error]\n    E --> B\n    D ==> F((Selesai))\n    classDef bahaya fill:#ffe3e3,stroke:#e03131,color:#c92a2a\n    E:::bahaya\n";
 
 fn main() -> eframe::Result<()> {
     let arg = std::env::args().nth(1).map(PathBuf::from);
@@ -644,10 +644,16 @@ impl eframe::App for App {
 }
 
 fn draw_node(p: &egui::Painter, n: &SceneNode, c: Pos2, zoom: f32, hovered: bool) {
+    // Tema per-bentuk, ditimpa style/classDef kustom dari teks.
     let ss = flowmaid::style::shape_style(n.shape);
-    let fill = hex(ss.fill);
+    let fill = hex(n.style.fill.as_deref().unwrap_or(ss.fill));
+    let base_w = n.style.stroke_width.unwrap_or(1.6) as f32;
     let (w, h) = (n.w as f32 * zoom, n.h as f32 * zoom);
-    let stroke = Stroke::new(if hovered { 2.8 } else { 1.6 } * zoom, hex(ss.stroke));
+    let stroke = Stroke::new(
+        (if hovered { base_w + 1.2 } else { base_w }) * zoom,
+        hex(n.style.stroke.as_deref().unwrap_or(ss.stroke)),
+    );
+    let text_color = n.style.color.as_deref().map(hex).unwrap_or(TEXT);
     match n.shape {
         Shape::Circle => {
             p.circle(c, w / 2.0, fill, stroke);
@@ -671,7 +677,13 @@ fn draw_node(p: &egui::Painter, n: &SceneNode, c: Pos2, zoom: f32, hovered: bool
             p.rect(r, round, fill, stroke);
         }
     }
-    p.text(c, Align2::CENTER_CENTER, &n.label, FontId::proportional(14.0 * zoom), TEXT);
+    p.text(
+        c,
+        Align2::CENTER_CENTER,
+        &n.label,
+        FontId::proportional(14.0 * zoom),
+        text_color,
+    );
 }
 
 /// Tabel entitas ER: header berwarna + baris atribut
