@@ -1,4 +1,4 @@
-//! Demo editor drag & drop untuk flowmaid (eframe/egui).
+//! flowmaid desktop — editor diagram interaktif di atas engine flowmaid.
 //!
 //! - Panel kiri : editor teks Mermaid, live dengan pola "last good render"
 //! - Panel kanan: kanvas — node bisa DIGESER, edge mengikuti realtime
@@ -40,7 +40,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "flowmaid — demo drag & drop",
+        "flowmaid desktop",
         opts,
         Box::new(|_cc| Ok(Box::new(App::new(src)))),
     )

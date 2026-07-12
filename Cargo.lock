@@ -1081,7 +1081,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0a71a9169d2351b3fe2352ea74891470b63cb8950c12caea517cf1ddddfe4111"
 
 [[package]]
-name = "flowmaid-demo"
+name = "flowmaid-desktop"
 version = "0.1.0"
 dependencies = [
  "eframe",
