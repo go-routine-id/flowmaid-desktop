@@ -20,11 +20,24 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const EDGE: Color32 = Color32::from_rgb(0x44, 0x50, 0x7a);
-const FILL: Color32 = Color32::from_rgb(0xee, 0xf1, 0xfb);
-const BORDER: Color32 = Color32::from_rgb(0x5b, 0x6d, 0xc0);
 const TEXT: Color32 = Color32::from_rgb(0x23, 0x28, 0x40);
 const LABEL_BORDER: Color32 = Color32::from_rgb(0xd5, 0xd9, 0xec);
 const TYPE_MUTED: Color32 = Color32::from_rgb(0x6a, 0x70, 0x86);
+
+/// `#rrggbb` (tema engine) → Color32, supaya kanvas dan ekspor SVG
+/// memakai warna yang persis sama.
+fn hex(c: &str) -> Color32 {
+    if c.len() == 7 && c.starts_with('#') {
+        if let (Ok(r), Ok(g), Ok(b)) = (
+            u8::from_str_radix(&c[1..3], 16),
+            u8::from_str_radix(&c[3..5], 16),
+            u8::from_str_radix(&c[5..7], 16),
+        ) {
+            return Color32::from_rgb(r, g, b);
+        }
+    }
+    Color32::GRAY
+}
 
 const MIN_ZOOM: f32 = 0.2;
 const MAX_ZOOM: f32 = 4.0;
@@ -566,10 +579,12 @@ impl eframe::App for App {
                 })
                 .collect();
             let mut moved = false;
+            let mut hovered_node: Option<usize> = None;
             for (i, rect) in rects.iter().enumerate() {
                 let resp = ui.interact(*rect, egui::Id::new(("flowrs-node", i)), Sense::drag());
                 if resp.hovered() || resp.dragged() {
                     ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
+                    hovered_node = Some(i);
                 }
                 if resp.dragged() {
                     let d = resp.drag_delta() / zoom; // delta layar -> dunia
@@ -615,24 +630,27 @@ impl eframe::App for App {
                 }
             }
             if is_er {
-                for (n, t) in self.scn.nodes.iter().zip(&self.tables) {
-                    draw_table(painter, n, t, ts(n.x, n.y), zoom);
+                for (i, (n, t)) in self.scn.nodes.iter().zip(&self.tables).enumerate() {
+                    let accent = hex(flowmaid::style::accent(i));
+                    draw_table(painter, n, t, ts(n.x, n.y), zoom, accent, hovered_node == Some(i));
                 }
             } else {
-                for n in &self.scn.nodes {
-                    draw_node(painter, n, ts(n.x, n.y), zoom);
+                for (i, n) in self.scn.nodes.iter().enumerate() {
+                    draw_node(painter, n, ts(n.x, n.y), zoom, hovered_node == Some(i));
                 }
             }
         });
     }
 }
 
-fn draw_node(p: &egui::Painter, n: &SceneNode, c: Pos2, zoom: f32) {
+fn draw_node(p: &egui::Painter, n: &SceneNode, c: Pos2, zoom: f32, hovered: bool) {
+    let ss = flowmaid::style::shape_style(n.shape);
+    let fill = hex(ss.fill);
     let (w, h) = (n.w as f32 * zoom, n.h as f32 * zoom);
-    let stroke = Stroke::new(1.6 * zoom, BORDER);
+    let stroke = Stroke::new(if hovered { 2.8 } else { 1.6 } * zoom, hex(ss.stroke));
     match n.shape {
         Shape::Circle => {
-            p.circle(c, w / 2.0, FILL, stroke);
+            p.circle(c, w / 2.0, fill, stroke);
         }
         Shape::Diamond => {
             let pts = vec![
@@ -641,7 +659,7 @@ fn draw_node(p: &egui::Painter, n: &SceneNode, c: Pos2, zoom: f32) {
                 Pos2::new(c.x, c.y + h / 2.0),
                 Pos2::new(c.x - w / 2.0, c.y),
             ];
-            p.add(egui::epaint::PathShape::convex_polygon(pts, FILL, stroke));
+            p.add(egui::epaint::PathShape::convex_polygon(pts, fill, stroke));
         }
         _ => {
             let r = Rect::from_center_size(c, Vec2::new(w, h));
@@ -650,7 +668,7 @@ fn draw_node(p: &egui::Painter, n: &SceneNode, c: Pos2, zoom: f32) {
                 Shape::Stadium => h / 2.0,
                 _ => 3.0 * zoom,
             };
-            p.rect(r, round, FILL, stroke);
+            p.rect(r, round, fill, stroke);
         }
     }
     p.text(c, Align2::CENTER_CENTER, &n.label, FontId::proportional(14.0 * zoom), TEXT);
@@ -658,7 +676,15 @@ fn draw_node(p: &egui::Painter, n: &SceneNode, c: Pos2, zoom: f32) {
 
 /// Tabel entitas ER: header berwarna + baris atribut
 /// (tipe redup | nama | tag kunci rata kanan).
-fn draw_table(p: &egui::Painter, n: &SceneNode, t: &ErTable, c: Pos2, zoom: f32) {
+fn draw_table(
+    p: &egui::Painter,
+    n: &SceneNode,
+    t: &ErTable,
+    c: Pos2,
+    zoom: f32,
+    accent: Color32,
+    hovered: bool,
+) {
     use flowmaid::er::{COL_GAP, HEADER_H, PAD, ROW_H};
     let (w, h) = (n.w as f32 * zoom, n.h as f32 * zoom);
     let x0 = c.x - w / 2.0;
@@ -668,7 +694,7 @@ fn draw_table(p: &egui::Painter, n: &SceneNode, t: &ErTable, c: Pos2, zoom: f32)
         Rect::from_min_size(Pos2::new(x0, y0), Vec2::new(w, h)),
         round,
         Color32::WHITE,
-        Stroke::new(1.6 * zoom, BORDER),
+        Stroke::new(if hovered { 2.8 } else { 1.6 } * zoom, accent),
     );
     let hh = HEADER_H as f32 * zoom;
     p.rect(
@@ -679,7 +705,7 @@ fn draw_table(p: &egui::Painter, n: &SceneNode, t: &ErTable, c: Pos2, zoom: f32)
             sw: 0.0,
             se: 0.0,
         },
-        BORDER,
+        accent,
         Stroke::NONE,
     );
     p.text(
