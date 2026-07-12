@@ -1001,24 +1001,81 @@ fn draw_node(p: &egui::Painter, n: &SceneNode, c: Pos2, zoom: f32, hovered: bool
         hex(n.style.stroke.as_deref().unwrap_or(ss.stroke)),
     );
     let text_color = n.style.color.as_deref().map(hex).unwrap_or(TEXT);
+    let poly = |pts: Vec<Pos2>| egui::epaint::PathShape::convex_polygon(pts, fill, stroke);
+    let (hw, hh) = (w / 2.0, h / 2.0);
     match n.shape {
         Shape::Circle => {
-            p.circle(c, w / 2.0, fill, stroke);
+            p.circle(c, hw, fill, stroke);
+        }
+        Shape::DoubleCircle => {
+            p.circle(c, hw, fill, stroke);
+            p.circle(c, hw - 4.0 * zoom, Color32::TRANSPARENT, stroke);
         }
         Shape::Diamond => {
-            let pts = vec![
-                Pos2::new(c.x, c.y - h / 2.0),
-                Pos2::new(c.x + w / 2.0, c.y),
-                Pos2::new(c.x, c.y + h / 2.0),
-                Pos2::new(c.x - w / 2.0, c.y),
-            ];
-            p.add(egui::epaint::PathShape::convex_polygon(pts, fill, stroke));
+            p.add(poly(vec![
+                Pos2::new(c.x, c.y - hh),
+                Pos2::new(c.x + hw, c.y),
+                Pos2::new(c.x, c.y + hh),
+                Pos2::new(c.x - hw, c.y),
+            ]));
+        }
+        Shape::Hexagon => {
+            let k = (14.0 * zoom).min(w / 4.0);
+            p.add(poly(vec![
+                Pos2::new(c.x - hw, c.y),
+                Pos2::new(c.x - hw + k, c.y - hh),
+                Pos2::new(c.x + hw - k, c.y - hh),
+                Pos2::new(c.x + hw, c.y),
+                Pos2::new(c.x + hw - k, c.y + hh),
+                Pos2::new(c.x - hw + k, c.y + hh),
+            ]));
+        }
+        Shape::Parallelogram | Shape::ParallelogramAlt => {
+            let k = (14.0 * zoom).min(w / 4.0);
+            let pts = if matches!(n.shape, Shape::Parallelogram) {
+                vec![
+                    Pos2::new(c.x - hw + k, c.y - hh),
+                    Pos2::new(c.x + hw, c.y - hh),
+                    Pos2::new(c.x + hw - k, c.y + hh),
+                    Pos2::new(c.x - hw, c.y + hh),
+                ]
+            } else {
+                vec![
+                    Pos2::new(c.x - hw, c.y - hh),
+                    Pos2::new(c.x + hw - k, c.y - hh),
+                    Pos2::new(c.x + hw, c.y + hh),
+                    Pos2::new(c.x - hw + k, c.y + hh),
+                ]
+            };
+            p.add(poly(pts));
+        }
+        Shape::Cylinder => {
+            let ry = (8.0 * zoom).min(h / 4.0);
+            // Body (rounded top/bottom approximates the caps) + a
+            // top arc line for the database look.
+            let body = Rect::from_center_size(c, Vec2::new(w, h - ry));
+            p.rect(body, ry, fill, stroke);
+            let top = c.y - hh + ry;
+            p.line_segment(
+                [Pos2::new(c.x - hw, top), Pos2::new(c.x + hw, top)],
+                stroke,
+            );
+        }
+        Shape::Subroutine => {
+            let r = Rect::from_center_size(c, Vec2::new(w, h));
+            p.rect(r, 3.0 * zoom, fill, stroke);
+            for dx in [-hw + 8.0 * zoom, hw - 8.0 * zoom] {
+                p.line_segment(
+                    [Pos2::new(c.x + dx, c.y - hh), Pos2::new(c.x + dx, c.y + hh)],
+                    stroke,
+                );
+            }
         }
         _ => {
             let r = Rect::from_center_size(c, Vec2::new(w, h));
             let round = match n.shape {
                 Shape::Rounded => 9.0 * zoom,
-                Shape::Stadium => h / 2.0,
+                Shape::Stadium => hh,
                 _ => 3.0 * zoom,
             };
             p.rect(r, round, fill, stroke);
