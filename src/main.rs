@@ -119,15 +119,6 @@ const CONTOH: &str = "%% Geser node dengan mouse, atau edit teks ini.\n%% Warna 
 
 fn main() -> eframe::Result<()> {
     let arg = std::env::args().nth(1).map(PathBuf::from);
-    let (src, path) = match arg {
-        Some(p) => match std::fs::read_to_string(&p) {
-            // Canonicalize argumen CLI relatif supaya highlight di
-            // explorer cocok dengan path absolut pohon.
-            Ok(t) => (t, Some(std::fs::canonicalize(&p).unwrap_or(p))),
-            Err(_) => (CONTOH.to_string(), None),
-        },
-        None => (CONTOH.to_string(), None),
-    };
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1150.0, 720.0]),
         ..Default::default()
@@ -163,14 +154,19 @@ fn main() -> eframe::Result<()> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let mut app = App::new(src, path, recent, workspace);
-            // Buka kembali tab sesi lalu; open_path men-dedupe
-            // terhadap dokumen argumen CLI. Fokus kembali ke tab
-            // pertama (= file CLI bila ada, karena ia tab 0).
+            // SEMUA pembukaan file — termasuk argumen CLI — lewat
+            // open_path, supaya routing .md → blok mermaid dan
+            // dedupe tab berlaku seragam. (Dulu argumen CLI dibaca
+            // mentah ke editor: file .md gagal parse → preview kosong.)
+            let mut app = App::new(CONTOH.to_string(), None, recent, workspace);
             for p in tabs {
                 app.open_path(p);
             }
-            app.switch_to(0);
+            match arg {
+                // File dari CLI dibuka terakhir → jadi tab aktif.
+                Some(p) => app.open_path(p),
+                None => app.switch_to(0),
+            }
             Ok(Box::new(app))
         }),
     )
