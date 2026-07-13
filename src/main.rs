@@ -1,5 +1,7 @@
 //! flowmaid desktop — editor diagram interaktif di atas engine flowmaid.
 //!
+//! - Multi-file : tab dokumen ala editor — klik file membuka tab baru,
+//!   Cmd+W menutup, tab dirty ditahan dialog, sesi tab dipulihkan
 //! - Panel kiri : explorer folder ala VSCode (klik file .mmd untuk buka)
 //! - Area utama : tab Preview | Split | Code
 //!     - Preview: kanvas penuh — node bisa DIGESER, edge realtime,
@@ -147,17 +149,37 @@ fn main() -> eframe::Result<()> {
                 .and_then(|s| s.get_string("workspace"))
                 .map(PathBuf::from)
                 .filter(|p| p.is_dir());
-            Ok(Box::new(App::new(src, path, recent, workspace)))
+            // Tab sesi sebelumnya (hanya yang filenya masih ada).
+            let tabs: Vec<PathBuf> = cc
+                .storage
+                .and_then(|s| s.get_string("tabs"))
+                .map(|s| {
+                    s.lines()
+                        .filter(|l| !l.is_empty())
+                        .map(PathBuf::from)
+                        .filter(|p| p.is_file())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut app = App::new(src, path, recent, workspace);
+            // Buka kembali tab sesi lalu; open_path men-dedupe
+            // terhadap dokumen argumen CLI. Fokus kembali ke tab
+            // pertama (= file CLI bila ada, karena ia tab 0).
+            for p in tabs {
+                app.open_path(p);
+            }
+            app.switch_to(0);
+            Ok(Box::new(app))
         }),
     )
 }
 
 /// Aksi yang bisa membuang perubahan; ditunda ke dialog konfirmasi
-/// bila dokumen sedang dirty.
+/// bila dokumen yang bersangkutan sedang dirty. Sejak ada tab,
+/// membuka file tak pernah membuang apa pun (selalu jadi tab baru) —
+/// hanya menutup tab yang butuh konfirmasi.
 enum Pending {
-    New,
-    OpenDialog,
-    OpenPath(PathBuf),
+    CloseTab(usize),
 }
 
 /// Tab area utama: pratinjau, terbelah, atau editor teks.
@@ -201,7 +223,62 @@ struct TreeEntry {
     is_dir: bool,
 }
 
+/// State lengkap satu dokumen (satu tab). Dokumen AKTIF tinggal di
+/// field-field `App` (kode gambar/editor tak perlu berubah); struct
+/// ini memarkir tab non-aktif, di-swap saat pindah tab. Entri milik
+/// tab aktif di `App::docs` adalah cangkang kosong.
+struct Doc {
+    src: String,
+    path: Option<PathBuf>,
+    saved_src: String,
+    model: Model,
+    pos: Vec<(f64, f64)>,
+    scn: Scene,
+    tables: Vec<ErTable>,
+    cards: Vec<(Card, Card)>,
+    boxes: Vec<ClassBox>,
+    rels: Vec<RelStyle>,
+    pie: Option<PieScene>,
+    seq: Option<SeqScene>,
+    pie_labels: Vec<Option<String>>,
+    pie_empty: bool,
+    seq_labels: Vec<String>,
+    error: Option<String>,
+    zoom: f32,
+    pan: Vec2,
+}
+
+impl Doc {
+    /// Cangkang kosong — placeholder untuk slot tab aktif.
+    fn empty() -> Doc {
+        Doc {
+            src: String::new(),
+            path: None,
+            saved_src: String::new(),
+            model: Model::Flow(Graph::default()),
+            pos: Vec::new(),
+            scn: blank_scene(0.0, 0.0),
+            tables: Vec::new(),
+            cards: Vec::new(),
+            boxes: Vec::new(),
+            rels: Vec::new(),
+            pie: None,
+            seq: None,
+            pie_labels: Vec::new(),
+            pie_empty: false,
+            seq_labels: Vec::new(),
+            error: None,
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+        }
+    }
+}
+
 struct App {
+    // Tab dokumen: docs[active] = cangkang; state aslinya ada di
+    // field src/path/model/... di bawah (dokumen aktif).
+    docs: Vec<Doc>,
+    active: usize,
     src: String,
     path: Option<PathBuf>, // file yang sedang dibuka (None = belum disimpan)
     saved_src: String,     // isi terakhir yang tersimpan, untuk deteksi dirty
@@ -247,6 +324,8 @@ impl App {
     ) -> Self {
         let saved_src = src.clone();
         let mut app = App {
+            docs: vec![Doc::empty()],
+            active: 0,
             src,
             path,
             saved_src,
@@ -492,12 +571,115 @@ impl App {
         self.recent.truncate(8);
     }
 
+    // ── Manajemen tab ─────────────────────────────────────────────
+
+    /// Parkir dokumen aktif ke slot cangkangnya di `docs`.
+    fn park(&mut self) {
+        let d = &mut self.docs[self.active];
+        d.src = std::mem::take(&mut self.src);
+        d.path = self.path.take();
+        d.saved_src = std::mem::take(&mut self.saved_src);
+        d.model = std::mem::replace(&mut self.model, Model::Flow(Graph::default()));
+        d.pos = std::mem::take(&mut self.pos);
+        d.scn = std::mem::replace(&mut self.scn, blank_scene(0.0, 0.0));
+        d.tables = std::mem::take(&mut self.tables);
+        d.cards = std::mem::take(&mut self.cards);
+        d.boxes = std::mem::take(&mut self.boxes);
+        d.rels = std::mem::take(&mut self.rels);
+        d.pie = self.pie.take();
+        d.seq = self.seq.take();
+        d.pie_labels = std::mem::take(&mut self.pie_labels);
+        d.pie_empty = self.pie_empty;
+        d.seq_labels = std::mem::take(&mut self.seq_labels);
+        d.error = self.error.take();
+        d.zoom = self.zoom;
+        d.pan = self.pan;
+    }
+
+    /// Muat dokumen ke-`i` dari parkiran menjadi dokumen aktif
+    /// (isi lama field aktif DIBUANG — parkir dulu bila perlu).
+    fn load(&mut self, i: usize) {
+        self.active = i;
+        let d = &mut self.docs[i];
+        self.src = std::mem::take(&mut d.src);
+        self.path = d.path.take();
+        self.saved_src = std::mem::take(&mut d.saved_src);
+        self.model = std::mem::replace(&mut d.model, Model::Flow(Graph::default()));
+        self.pos = std::mem::take(&mut d.pos);
+        self.scn = std::mem::replace(&mut d.scn, blank_scene(0.0, 0.0));
+        self.tables = std::mem::take(&mut d.tables);
+        self.cards = std::mem::take(&mut d.cards);
+        self.boxes = std::mem::take(&mut d.boxes);
+        self.rels = std::mem::take(&mut d.rels);
+        self.pie = d.pie.take();
+        self.seq = d.seq.take();
+        self.pie_labels = std::mem::take(&mut d.pie_labels);
+        self.pie_empty = d.pie_empty;
+        self.seq_labels = std::mem::take(&mut d.seq_labels);
+        self.error = d.error.take();
+        self.zoom = d.zoom;
+        self.pan = d.pan;
+    }
+
+    fn switch_to(&mut self, i: usize) {
+        if i != self.active && i < self.docs.len() {
+            self.park();
+            self.load(i);
+        }
+    }
+
+    /// Judul tab ke-`i` (nama file / "tanpa judul") — tab aktif dibaca
+    /// dari field live, bukan dari cangkangnya.
+    fn tab_title(&self, i: usize) -> String {
+        let (path, dirty) = if i == self.active {
+            (&self.path, self.dirty())
+        } else {
+            let d = &self.docs[i];
+            (&d.path, d.src != d.saved_src)
+        };
+        let name = path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "tanpa judul".into());
+        if dirty {
+            format!("{name} •")
+        } else {
+            name
+        }
+    }
+
+    /// Dokumen aktif masih persis contoh bawaan yang belum disentuh?
+    /// (Dipakai supaya membuka file tak meninggalkan tab sampah.)
+    fn active_is_pristine_untitled(&self) -> bool {
+        self.path.is_none() && !self.dirty() && self.src == CONTOH
+    }
+
     fn open_path(&mut self, p: PathBuf) {
+        // Canonicalize agar cocok dengan path pohon explorer
+        // (highlight file aktif) dan untuk dedupe antar-tab.
+        let p = std::fs::canonicalize(&p).unwrap_or(p);
+        // Sudah terbuka? Aktifkan tabnya saja.
+        if self.path.as_ref() == Some(&p) {
+            return;
+        }
+        if let Some(i) = (0..self.docs.len())
+            .filter(|&i| i != self.active)
+            .find(|&i| self.docs[i].path.as_ref() == Some(&p))
+        {
+            self.switch_to(i);
+            self.status = format!("pindah ke: {}", p.display());
+            return;
+        }
         match std::fs::read_to_string(&p) {
             Ok(t) => {
-                // Canonicalize agar cocok dengan path pohon explorer
-                // (highlight file aktif); fallback ke path asli.
-                let p = std::fs::canonicalize(&p).unwrap_or(p);
+                // Tab contoh bawaan yang belum disentuh ditimpa di
+                // tempat; selain itu file baru dibuka di TAB BARU.
+                if !self.active_is_pristine_untitled() {
+                    self.park();
+                    self.docs.push(Doc::empty());
+                    self.active = self.docs.len() - 1;
+                }
                 self.src = t;
                 self.saved_src = self.src.clone();
                 self.reparse();
@@ -510,13 +692,51 @@ impl App {
         }
     }
 
+    /// Tab baru berisi contoh bawaan.
     fn new_file(&mut self) {
+        self.park();
+        self.docs.push(Doc::empty());
+        self.active = self.docs.len() - 1;
         self.src = CONTOH.to_string();
         self.saved_src = self.src.clone();
         self.path = None;
         self.reparse();
         self.reset_view();
         self.status = "dokumen baru".into();
+    }
+
+    /// Minta tutup tab ke-`i`; tab dirty ditahan di dialog konfirmasi.
+    /// Tab non-aktif diaktifkan dulu supaya "Simpan dulu" di dialog
+    /// bekerja pada dokumen yang benar.
+    fn request_close(&mut self, i: usize) {
+        if self.pending.is_some() || i >= self.docs.len() {
+            return;
+        }
+        self.switch_to(i);
+        if self.dirty() {
+            self.pending = Some(Pending::CloseTab(i));
+        } else {
+            self.close_tab(i);
+        }
+    }
+
+    /// Tutup tab ke-`i` (harus tab aktif — dijamin `request_close`).
+    /// Tab terakhir tidak ditutup, melainkan diganti dokumen baru.
+    fn close_tab(&mut self, i: usize) {
+        if self.docs.len() <= 1 {
+            self.src = CONTOH.to_string();
+            self.saved_src = self.src.clone();
+            self.path = None;
+            self.reparse();
+            self.reset_view();
+            self.status = "dokumen baru".into();
+            return;
+        }
+        // State asli tab aktif ada di field live — cukup buang
+        // cangkangnya lalu muat tetangga.
+        self.docs.remove(i);
+        self.load(i.min(self.docs.len() - 1));
+        self.status = "tab ditutup".into();
     }
 
     /// Simpan ke file saat ini; belum punya file → Simpan Sebagai.
@@ -683,42 +903,26 @@ impl App {
             } else {
                 let selected = self.path.as_deref() == Some(t.path.as_path());
                 if ui.selectable_label(selected, &t.name).clicked() && !selected {
-                    self.request(Pending::OpenPath(t.path.clone()));
+                    self.open_path(t.path.clone());
                 }
             }
-        }
-    }
-
-    /// Jalankan aksi yang bisa membuang perubahan; kalau dokumen
-    /// dirty, tahan dulu di dialog konfirmasi.
-    fn request(&mut self, act: Pending) {
-        // Selagi dialog konfirmasi terbuka, abaikan aksi baru —
-        // kalau tidak, aksi tertunda bisa tertimpa diam-diam dan
-        // tombol "Buang perubahan" membuang aksi yang salah
-        // (ditemukan bughunter).
-        if self.pending.is_some() {
-            return;
-        }
-        if self.dirty() {
-            self.pending = Some(act);
-        } else {
-            self.perform(act);
         }
     }
 
     fn perform(&mut self, act: Pending) {
         match act {
-            Pending::New => self.new_file(),
-            Pending::OpenDialog => {
-                let mut dlg = rfd::FileDialog::new().add_filter("Mermaid", &["mmd", "txt"]);
-                if let Some(dir) = self.path.as_ref().and_then(|p| p.parent()) {
-                    dlg = dlg.set_directory(dir);
-                }
-                if let Some(p) = dlg.pick_file() {
-                    self.open_path(p);
-                }
-            }
-            Pending::OpenPath(p) => self.open_path(p),
+            Pending::CloseTab(i) => self.close_tab(i),
+        }
+    }
+
+    /// Dialog buka file — hasilnya jadi tab (tak ada yang terbuang).
+    fn open_dialog(&mut self) {
+        let mut dlg = rfd::FileDialog::new().add_filter("Mermaid", &["mmd", "txt"]);
+        if let Some(dir) = self.path.as_ref().and_then(|p| p.parent()) {
+            dlg = dlg.set_directory(dir);
+        }
+        if let Some(p) = dlg.pick_file() {
+            self.open_path(p);
         }
     }
 }
@@ -733,6 +937,15 @@ impl eframe::App for App {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
         );
+        // Tab yang punya file dibuka lagi di sesi berikutnya
+        // (dokumen tanpa judul tidak — isinya tak dipersist).
+        let tabs: Vec<String> = (0..self.docs.len())
+            .filter_map(|i| {
+                let p = if i == self.active { &self.path } else { &self.docs[i].path };
+                p.as_ref().map(|p| p.display().to_string())
+            })
+            .collect();
+        storage.set_string("tabs", tabs.join("\n"));
     }
 
     // Catatan audit: persist_egui_memory sengaja DIBIARKAN default
@@ -751,6 +964,7 @@ impl eframe::App for App {
             KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::O);
         const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
         const NEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
+        const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
         if ctx.input_mut(|i| i.consume_shortcut(&SAVE_AS)) {
             self.save_as();
         } else if ctx.input_mut(|i| i.consume_shortcut(&SAVE)) {
@@ -759,30 +973,23 @@ impl eframe::App for App {
         if ctx.input_mut(|i| i.consume_shortcut(&OPEN_FOLDER)) {
             self.open_folder_dialog();
         } else if ctx.input_mut(|i| i.consume_shortcut(&OPEN)) {
-            self.request(Pending::OpenDialog);
+            self.open_dialog();
         }
         if ctx.input_mut(|i| i.consume_shortcut(&NEW)) {
-            self.request(Pending::New);
+            self.new_file();
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&CLOSE_TAB)) {
+            self.request_close(self.active);
         }
 
-        // Drag & drop FILE .mmd ke jendela. Banyak file sekaligus:
-        // buka yang pertama, beri tahu sisanya diabaikan.
+        // Drag & drop FILE .mmd ke jendela — tiap file jadi tab.
         let dropped: Vec<PathBuf> = ctx
             .input(|i| i.raw.dropped_files.clone())
             .into_iter()
             .filter_map(|f| f.path)
             .collect();
-        if let Some(p) = dropped.first().cloned() {
-            if dropped.len() > 1 {
-                self.status = format!(
-                    "membuka {}; {} file lain diabaikan",
-                    p.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    dropped.len() - 1
-                );
-            }
-            self.request(Pending::OpenPath(p));
+        for p in dropped {
+            self.open_path(p);
         }
 
         // Dialog konfirmasi untuk aksi yang membuang perubahan.
@@ -829,12 +1036,12 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Baru  (Cmd+N)").clicked() {
-                        self.request(Pending::New);
+                    if ui.button("Tab Baru  (Cmd+N)").clicked() {
+                        self.new_file();
                         ui.close_menu();
                     }
                     if ui.button("Buka…  (Cmd+O)").clicked() {
-                        self.request(Pending::OpenDialog);
+                        self.open_dialog();
                         ui.close_menu();
                     }
                     if ui.button("Buka Folder…  (Shift+Cmd+O)").clicked() {
@@ -845,12 +1052,16 @@ impl eframe::App for App {
                         ui.menu_button("Baru dibuka", |ui| {
                             for r in self.recent.clone() {
                                 if ui.button(&r).clicked() {
-                                    self.request(Pending::OpenPath(PathBuf::from(&r)));
+                                    self.open_path(PathBuf::from(&r));
                                     ui.close_menu();
                                 }
                             }
                         });
                     });
+                    if ui.button("Tutup Tab  (Cmd+W)").clicked() {
+                        self.request_close(self.active);
+                        ui.close_menu();
+                    }
                     ui.separator();
                     if ui.button("Simpan  (Cmd+S)").clicked() {
                         self.save_doc();
@@ -866,6 +1077,38 @@ impl eframe::App for App {
                         ui.close_menu();
                     }
                 });
+            });
+        });
+
+        // Bar tab dokumen — klik pindah, "x" menutup, "+" tab baru.
+        egui::TopBottomPanel::top("tabbar").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let mut switch: Option<usize> = None;
+                let mut close: Option<usize> = None;
+                for i in 0..self.docs.len() {
+                    let title = self.tab_title(i);
+                    let active = i == self.active;
+                    if ui.selectable_label(active, title).clicked() && !active {
+                        switch = Some(i);
+                    }
+                    if ui
+                        .small_button("x")
+                        .on_hover_text("tutup tab (Cmd+W)")
+                        .clicked()
+                    {
+                        close = Some(i);
+                    }
+                    ui.add_space(4.0);
+                }
+                if ui.small_button("+").on_hover_text("tab baru (Cmd+N)").clicked() {
+                    self.new_file();
+                }
+                if let Some(i) = switch {
+                    self.switch_to(i);
+                }
+                if let Some(i) = close {
+                    self.request_close(i);
+                }
             });
         });
 
@@ -1998,6 +2241,55 @@ mod tests {
         a.src = "flowchart TD\nX --> Y".into();
         a.reparse();
         assert!(a.pie.is_none() && a.seq.is_none());
+    }
+
+    #[test]
+    fn tabs_open_switch_dedupe_and_close() {
+        let dir = std::env::temp_dir().join(format!("flowmaid-tabs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.mmd"), "flowchart TD\nA1-->A2").unwrap();
+        std::fs::write(dir.join("b.mmd"), "pie\n\"x\" : 1").unwrap();
+
+        let mut app = app();
+        // Tab contoh yang belum disentuh ditimpa di tempat.
+        app.open_path(dir.join("a.mmd"));
+        assert_eq!(app.docs.len(), 1, "pristine untitled digantikan, bukan +tab");
+        assert!(app.tab_title(0).starts_with("a.mmd"));
+
+        // File kedua membuka TAB BARU dan aktif.
+        app.open_path(dir.join("b.mmd"));
+        assert_eq!(app.docs.len(), 2);
+        assert_eq!(app.active, 1);
+        assert!(matches!(app.model, Model::Pie(_)), "tab aktif = pie");
+
+        // Membuka file yang sudah ada tabnya = pindah, bukan duplikat.
+        app.open_path(dir.join("a.mmd"));
+        assert_eq!(app.docs.len(), 2, "tak ada tab duplikat");
+        assert_eq!(app.active, 0);
+        assert!(matches!(app.model, Model::Flow(_)));
+
+        // Geseran node bertahan saat bolak-balik tab.
+        let dragged = (app.pos[0].0 + 300.0, app.pos[0].1);
+        app.pos[0] = dragged;
+        app.switch_to(1);
+        app.switch_to(0);
+        assert_eq!(app.pos[0], dragged, "posisi geser selamat lintas tab");
+
+        // Tutup tab aktif yang bersih → tetangga termuat.
+        app.request_close(0);
+        assert!(app.pending.is_none(), "tab bersih tak butuh dialog");
+        assert_eq!(app.docs.len(), 1);
+        assert!(matches!(app.model, Model::Pie(_)), "tetangga (pie) jadi aktif");
+
+        // Tab dirty ditahan dialog; tab terakhir tak pernah hilang.
+        app.src.push_str("\n\"y\" : 2");
+        app.request_close(0);
+        assert!(matches!(app.pending, Some(Pending::CloseTab(0))));
+        app.pending = None;
+        app.perform(Pending::CloseTab(0)); // "Buang perubahan"
+        assert_eq!(app.docs.len(), 1, "tab terakhir diganti dokumen baru");
+        assert!(app.path.is_none() && !app.dirty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
