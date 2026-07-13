@@ -2,6 +2,8 @@
 //!
 //! - Multi-file : tab dokumen ala editor — klik file membuka tab baru,
 //!   Cmd+W menutup, tab dirty ditahan dialog, sesi tab dipulihkan
+//! - Markdown   : buka .md → tiap blok ```mermaid jadi tab; Simpan
+//!   menulis balik ke dalam fence-nya (crate `markdown`, via AST)
 //! - Panel kiri : explorer folder ala VSCode (klik file .mmd untuk buka)
 //! - Area utama : tab Preview | Split | Code
 //!     - Preview: kanvas penuh — node bisa DIGESER, edge realtime,
@@ -223,6 +225,15 @@ struct TreeEntry {
     is_dir: bool,
 }
 
+/// Dokumen ini berasal dari satu blok ```mermaid di dalam file
+/// Markdown: `path` = file .md induk, `index` = blok mermaid ke-n
+/// (0-based). Menyimpan berarti menulis balik KE DALAM fence-nya.
+#[derive(Clone)]
+struct MdHost {
+    path: PathBuf,
+    index: usize,
+}
+
 /// State lengkap satu dokumen (satu tab). Dokumen AKTIF tinggal di
 /// field-field `App` (kode gambar/editor tak perlu berubah); struct
 /// ini memarkir tab non-aktif, di-swap saat pindah tab. Entri milik
@@ -230,6 +241,7 @@ struct TreeEntry {
 struct Doc {
     src: String,
     path: Option<PathBuf>,
+    md_host: Option<MdHost>,
     saved_src: String,
     model: Model,
     pos: Vec<(f64, f64)>,
@@ -254,6 +266,7 @@ impl Doc {
         Doc {
             src: String::new(),
             path: None,
+            md_host: None,
             saved_src: String::new(),
             model: Model::Flow(Graph::default()),
             pos: Vec::new(),
@@ -281,6 +294,7 @@ struct App {
     active: usize,
     src: String,
     path: Option<PathBuf>, // file yang sedang dibuka (None = belum disimpan)
+    md_host: Option<MdHost>, // Some = dokumen ini blok mermaid di file .md
     saved_src: String,     // isi terakhir yang tersimpan, untuk deteksi dirty
     recent: Vec<String>,   // file terakhir dibuka, terbaru di depan
     workspace: Option<PathBuf>, // folder explorer ala VSCode (panel kiri)
@@ -295,6 +309,7 @@ struct App {
     // Kunci perubahan judul jendela (None = belum pernah dihitung).
     last_dirty: Option<bool>,
     last_titled_path: Option<PathBuf>,
+    last_titled_tab: usize,
     model: Model,             // dokumen valid terakhir
     pos: Vec<(f64, f64)>,     // posisi node/entitas, milik aplikasi (bisa digeser)
     scn: Scene,               // geometri terkini untuk digambar
@@ -328,6 +343,7 @@ impl App {
             active: 0,
             src,
             path,
+            md_host: None,
             saved_src,
             recent,
             workspace,
@@ -337,6 +353,7 @@ impl App {
             last_title: String::new(),
             last_dirty: None,
             last_titled_path: None,
+            last_titled_tab: usize::MAX,
             model: Model::Flow(Graph::default()),
             pos: Vec::new(),
             scn: Scene {
@@ -580,6 +597,7 @@ impl App {
         let d = &mut self.docs[self.active];
         d.src = std::mem::take(&mut self.src);
         d.path = self.path.take();
+        d.md_host = self.md_host.take();
         d.saved_src = std::mem::take(&mut self.saved_src);
         d.model = std::mem::replace(&mut self.model, Model::Flow(Graph::default()));
         d.pos = std::mem::take(&mut self.pos);
@@ -605,6 +623,7 @@ impl App {
         let d = &mut self.docs[i];
         self.src = std::mem::take(&mut d.src);
         self.path = d.path.take();
+        self.md_host = d.md_host.take();
         self.saved_src = std::mem::take(&mut d.saved_src);
         self.model = std::mem::replace(&mut d.model, Model::Flow(Graph::default()));
         self.pos = std::mem::take(&mut d.pos);
@@ -630,20 +649,30 @@ impl App {
         }
     }
 
-    /// Judul tab ke-`i` (nama file / "tanpa judul") — tab aktif dibaca
-    /// dari field live, bukan dari cangkangnya.
+    /// Judul tab ke-`i` (nama file / blok md / "tanpa judul") — tab
+    /// aktif dibaca dari field live, bukan dari cangkangnya.
     fn tab_title(&self, i: usize) -> String {
-        let (path, dirty) = if i == self.active {
-            (&self.path, self.dirty())
+        let (path, md, dirty) = if i == self.active {
+            (&self.path, &self.md_host, self.dirty())
         } else {
             let d = &self.docs[i];
-            (&d.path, d.src != d.saved_src)
+            (&d.path, &d.md_host, d.src != d.saved_src)
         };
-        let name = path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "tanpa judul".into());
+        let name = match (path, md) {
+            (Some(p), _) => p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "tanpa judul".into()),
+            (None, Some(h)) => format!(
+                "{} #{}",
+                h.path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                h.index + 1
+            ),
+            (None, None) => "tanpa judul".into(),
+        };
         if dirty {
             format!("{name} •")
         } else {
@@ -703,6 +732,15 @@ impl App {
         // Canonicalize agar cocok dengan path pohon explorer
         // (highlight file aktif) dan untuk dedupe antar-tab.
         let p = std::fs::canonicalize(&p).unwrap_or(p);
+        // File Markdown: ekstrak blok ```mermaid-nya jadi tab.
+        let ext = p
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if ext == "md" || ext == "markdown" {
+            self.open_markdown(p);
+            return;
+        }
         // Sudah terbuka? Aktifkan tabnya saja.
         if self.path.as_ref() == Some(&p) {
             return;
@@ -734,6 +772,58 @@ impl App {
             }
             Err(e) => self.status = format!("gagal membuka: {}", e),
         }
+    }
+
+    /// Buka file Markdown: tiap blok ```mermaid menjadi satu tab.
+    /// Menyimpan tab tersebut menulis balik ke dalam fence-nya.
+    fn open_markdown(&mut self, p: PathBuf) {
+        let md = match std::fs::read_to_string(&p) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("gagal membuka: {}", e);
+                return;
+            }
+        };
+        let blocks = mermaid_blocks(&md);
+        if blocks.is_empty() {
+            self.status = format!("tidak ada blok ```mermaid di {}", p.display());
+            return;
+        }
+        let host_eq = |h: &Option<MdHost>, i: usize| {
+            h.as_ref().is_some_and(|h| h.path == p && h.index == i)
+        };
+        let n = blocks.len();
+        let mut first_new: Option<usize> = None;
+        for (i, (src, _)) in blocks.into_iter().enumerate() {
+            // Dedupe: blok ini sudah punya tab? (aktif atau parkiran)
+            if host_eq(&self.md_host, i)
+                || self.docs.iter().enumerate().any(|(t, d)| t != self.active && host_eq(&d.md_host, i))
+            {
+                continue;
+            }
+            if !self.active_is_pristine_untitled() {
+                self.park();
+                self.docs.push(Doc::empty());
+                self.active = self.docs.len() - 1;
+            }
+            self.src = src;
+            self.saved_src = self.src.clone();
+            self.path = None;
+            self.md_host = Some(MdHost { path: p.clone(), index: i });
+            self.reparse();
+            self.reset_view();
+            first_new.get_or_insert(self.active);
+        }
+        // Fokus ke blok pertama file ini (baru maupun sudah ada).
+        let target = first_new.or_else(|| {
+            (0..self.docs.len())
+                .find(|&t| host_eq(if t == self.active { &self.md_host } else { &self.docs[t].md_host }, 0))
+        });
+        if let Some(t) = target {
+            self.switch_to(t);
+        }
+        self.status = format!("{}: {} blok mermaid", p.display(), n);
+        self.push_recent(&p);
     }
 
     /// Tab baru berisi contoh bawaan.
@@ -783,12 +873,54 @@ impl App {
         self.status = "tab ditutup".into();
     }
 
-    /// Simpan ke file saat ini; belum punya file → Simpan Sebagai.
-    /// Mengembalikan `true` bila dokumen benar-benar tersimpan.
+    /// Simpan ke file saat ini; blok Markdown menulis balik ke dalam
+    /// fence-nya; belum punya file → Simpan Sebagai. Mengembalikan
+    /// `true` bila dokumen benar-benar tersimpan.
     fn save_doc(&mut self) -> bool {
+        if self.md_host.is_some() {
+            return self.save_md_block();
+        }
         match self.path.clone() {
             Some(p) => self.write_to(&p),
             None => self.save_as(),
+        }
+    }
+
+    /// Tulis isi editor balik KE DALAM fence ```mermaid asalnya.
+    /// File induk dibaca ulang dan bloknya dicari lagi saat menyimpan,
+    /// jadi suntingan lain pada file (di luar blok ini) tidak hilang.
+    fn save_md_block(&mut self) -> bool {
+        let Some(host) = self.md_host.clone() else { return false };
+        let md = match std::fs::read_to_string(&host.path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("gagal menyimpan: {}", e);
+                return false;
+            }
+        };
+        let Some(next) = splice_md_block(&md, host.index, &self.src) else {
+            self.status = format!(
+                "gagal menyimpan: blok mermaid #{} tidak ditemukan lagi di {} \
+                 (file berubah, atau fence-nya ter-indentasi)",
+                host.index + 1,
+                host.path.display()
+            );
+            return false;
+        };
+        match std::fs::write(&host.path, next) {
+            Ok(_) => {
+                self.saved_src = self.src.clone();
+                self.status = format!(
+                    "tersimpan ke blok #{} di {}",
+                    host.index + 1,
+                    host.path.display()
+                );
+                true
+            }
+            Err(e) => {
+                self.status = format!("gagal menyimpan: {}", e);
+                false
+            }
         }
     }
 
@@ -810,6 +942,9 @@ impl App {
             Some(p) if self.write_to(&p) => {
                 self.push_recent(&p);
                 self.path = Some(p);
+                // Simpan-Sebagai melepaskan dokumen dari file .md
+                // induknya — ia kini file .mmd mandiri.
+                self.md_host = None;
                 true
             }
             _ => false,
@@ -906,7 +1041,12 @@ impl App {
                     // is_dir dihitung SEKALI di sini, bukan per frame.
                     let is_dir = path.is_dir() && !is_symlink(&path);
                     let lower = name.to_lowercase();
-                    if is_dir || lower.ends_with(".mmd") || lower.ends_with(".txt") {
+                    if is_dir
+                        || lower.ends_with(".mmd")
+                        || lower.ends_with(".txt")
+                        || lower.ends_with(".md")
+                        || lower.ends_with(".markdown")
+                    {
                         Some(TreeEntry { path, name, is_dir })
                     } else {
                         None
@@ -961,7 +1101,9 @@ impl App {
 
     /// Dialog buka file — hasilnya jadi tab (tak ada yang terbuang).
     fn open_dialog(&mut self) {
-        let mut dlg = rfd::FileDialog::new().add_filter("Mermaid", &["mmd", "txt"]);
+        let mut dlg = rfd::FileDialog::new()
+            .add_filter("Diagram", &["mmd", "txt", "md", "markdown"])
+            .add_filter("Markdown", &["md", "markdown"]);
         if let Some(dir) = self.path.as_ref().and_then(|p| p.parent()) {
             dlg = dlg.set_directory(dir);
         }
@@ -1539,19 +1681,24 @@ impl App {
     /// saat (dirty, path) berubah — bukan format! tiap frame.
     fn sync_title(&mut self, ctx: &egui::Context) {
         let dirty = self.dirty();
-        if Some(dirty) == self.last_dirty && self.path == self.last_titled_path {
+        if Some(dirty) == self.last_dirty
+            && self.path == self.last_titled_path
+            && self.active == self.last_titled_tab
+        {
             return;
         }
         self.last_dirty = Some(dirty);
         self.last_titled_path.clone_from(&self.path);
+        self.last_titled_tab = self.active;
+        // tab_title sudah menangani ketiga bentuk nama (file, blok
+        // md, tanpa judul); buang dot dirty-nya karena judul window
+        // memakai prefiks.
+        let name = self.tab_title(self.active);
+        let name = name.strip_suffix(" •").unwrap_or(&name);
         let title = format!(
             "{}{} — flowmaid desktop",
             if dirty { "• " } else { "" },
-            self.path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "tanpa judul".into())
+            name
         );
         if title != self.last_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -1878,6 +2025,61 @@ fn draw_card(
         zfont(11.0, zoom),
         TEXT,
     );
+}
+
+/// Blok ```mermaid di sebuah dokumen Markdown, diekstrak lewat AST
+/// crate `markdown` (bukan regex — fence bertilde, di dalam quote,
+/// dan info-string tetap terdeteksi benar). Tiap entri: isi blok +
+/// rentang byte SELURUH fence (pembuka s/d penutup) di sumber.
+fn mermaid_blocks(md: &str) -> Vec<(String, std::ops::Range<usize>)> {
+    fn walk(node: &markdown::mdast::Node, out: &mut Vec<(String, std::ops::Range<usize>)>) {
+        if let markdown::mdast::Node::Code(c) = node {
+            let lang = c.lang.as_deref().unwrap_or("");
+            if lang.eq_ignore_ascii_case("mermaid") || lang.eq_ignore_ascii_case("mmd") {
+                if let Some(p) = &c.position {
+                    out.push((c.value.clone(), p.start.offset..p.end.offset));
+                }
+            }
+        }
+        if let Some(children) = node.children() {
+            for ch in children {
+                walk(ch, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Ok(ast) = markdown::to_mdast(md, &markdown::ParseOptions::default()) {
+        walk(&ast, &mut out);
+    }
+    out
+}
+
+/// Ganti ISI blok mermaid ke-`index` di teks Markdown dengan `src`,
+/// mempertahankan baris fence pembuka/penutup apa adanya (termasuk
+/// info-string). Gagal (None) bila blok tak ditemukan lagi atau
+/// fence-nya ter-indentasi (mis. di dalam list — belum didukung).
+fn splice_md_block(md: &str, index: usize, src: &str) -> Option<String> {
+    let (_, range) = mermaid_blocks(md).into_iter().nth(index)?;
+    let block = &md[range.clone()];
+    let open_len = block.find('\n')?;
+    let close_start = block.rfind('\n')?;
+    let (open, close) = (&block[..open_len], &block[close_start + 1..]);
+    // Kedua baris harus benar-benar fence TANPA indentasi: fence di
+    // dalam list menuntut re-indentasi isi (belum didukung), dan
+    // fence tak tertutup di EOF membuat baris terakhir = konten.
+    let fence = |s: &str| s.starts_with("```") || s.starts_with("~~~");
+    if !fence(open) || !fence(close) {
+        return None;
+    }
+    let mut out = String::with_capacity(md.len() + src.len());
+    out.push_str(&md[..range.start]);
+    out.push_str(open);
+    out.push('\n');
+    out.push_str(src.trim_end_matches('\n'));
+    out.push('\n');
+    out.push_str(close);
+    out.push_str(&md[range.end..]);
+    Some(out)
 }
 
 /// Scene kosong dengan ukuran kanvas — dipakai diagram statis
@@ -2385,6 +2587,48 @@ mod tests {
         app.perform(Pending::CloseTab(0)); // "Buang perubahan"
         assert_eq!(app.docs.len(), 1, "tab terakhir diganti dokumen baru");
         assert!(app.path.is_none() && !app.dirty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn markdown_blocks_extract_open_as_tabs_and_save_back() {
+        let md = "# Judul\n\nteks pembuka\n\n```mermaid\nflowchart TD\nA-->B\n```\n\n\
+                  paragraf tengah\n\n```js\nconsole.log(1)\n```\n\n\
+                  ~~~mermaid\npie\n\"x\" : 1\n~~~\n\npenutup\n";
+        // Ekstraksi: dua blok mermaid, fence js dilewati.
+        let blocks = mermaid_blocks(md);
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].0.starts_with("flowchart TD"));
+        assert!(blocks[1].0.starts_with("pie"));
+
+        // Splice mengganti isi blok #2 tanpa menyentuh sekitarnya.
+        let out = splice_md_block(md, 1, "pie\n\"y\" : 9").unwrap();
+        assert!(out.contains("~~~mermaid\npie\n\"y\" : 9\n~~~"));
+        assert!(out.contains("console.log(1)") && out.contains("penutup"));
+        assert!(out.contains("A-->B"), "blok #1 tak tersentuh");
+
+        // Alur app: buka .md → 2 tab; edit; simpan → fence berubah.
+        let dir = std::env::temp_dir().join(format!("flowmaid-md-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mdpath = dir.join("doc.md");
+        std::fs::write(&mdpath, md).unwrap();
+        let mut a = app();
+        a.open_path(mdpath.clone());
+        assert_eq!(a.docs.len(), 2, "dua blok = dua tab");
+        assert!(a.tab_title(0).starts_with("doc.md #1"));
+        assert_eq!(a.active, 0, "fokus ke blok pertama");
+        assert!(matches!(a.model, Model::Flow(_)));
+
+        a.src = "flowchart TD\nA-->C".into();
+        assert!(a.save_doc(), "simpan blok md harus sukses");
+        let on_disk = std::fs::read_to_string(&mdpath).unwrap();
+        assert!(on_disk.contains("```mermaid\nflowchart TD\nA-->C\n```"));
+        assert!(on_disk.contains("# Judul") && on_disk.contains("~~~mermaid"));
+        assert!(!a.dirty());
+
+        // Buka ulang file yang sama tidak menduplikasi tab.
+        a.open_path(mdpath);
+        assert_eq!(a.docs.len(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -14,6 +14,7 @@ flowmaid = "0.11"
 # VoiceOver/NVDA (temuan verifikasi audit memory).
 eframe = { version = "0.29", features = ["persistence"] }
 rfd = "0.17.2"
+markdown = "1.0.0"
 
 # Rampingkan binary release dan bantu inlining lintas-crate.
 [profile.release]
