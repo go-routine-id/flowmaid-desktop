@@ -7,7 +7,7 @@ repository = "https://github.com/go-routine-id/flowmaid-desktop"
 publish = false # demo app — run from source
 
 [dependencies]
-flowmaid = "0.11"
+flowmaid = { version = "0.12", features = ["markdown"] }
 # Fitur default dipertahankan: accesskit TIDAK dibuang — pohon
 # aksesibilitasnya lazy (baru dibangun saat screen reader terhubung),
 # jadi biaya runtime-nya ~nol sedangkan membuangnya mematikan

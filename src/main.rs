@@ -901,7 +901,7 @@ impl App {
                 return false;
             }
         };
-        let Some(next) = splice_md_block(&md, host.index, &self.src) else {
+        let Some(next) = flowmaid::md::splice_block(&md, host.index, &self.src) else {
             self.status = format!(
                 "gagal menyimpan: blok mermaid #{} tidak ditemukan lagi di {} \
                  (file berubah, atau fence-nya ter-indentasi)",
@@ -2486,60 +2486,9 @@ fn draw_card(
     );
 }
 
-/// Blok ```mermaid di sebuah dokumen Markdown, diekstrak lewat AST
-/// crate `markdown` (bukan regex — fence bertilde, di dalam quote,
-/// dan info-string tetap terdeteksi benar). Tiap entri: isi blok +
-/// rentang byte SELURUH fence (pembuka s/d penutup) di sumber.
-fn mermaid_blocks(md: &str) -> Vec<(String, std::ops::Range<usize>)> {
-    fn walk(node: &markdown::mdast::Node, out: &mut Vec<(String, std::ops::Range<usize>)>) {
-        if let markdown::mdast::Node::Code(c) = node {
-            let lang = c.lang.as_deref().unwrap_or("");
-            if lang.eq_ignore_ascii_case("mermaid") || lang.eq_ignore_ascii_case("mmd") {
-                if let Some(p) = &c.position {
-                    out.push((c.value.clone(), p.start.offset..p.end.offset));
-                }
-            }
-        }
-        if let Some(children) = node.children() {
-            for ch in children {
-                walk(ch, out);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    if let Ok(ast) = markdown::to_mdast(md, &markdown::ParseOptions::default()) {
-        walk(&ast, &mut out);
-    }
-    out
-}
-
-/// Ganti ISI blok mermaid ke-`index` di teks Markdown dengan `src`,
-/// mempertahankan baris fence pembuka/penutup apa adanya (termasuk
-/// info-string). Gagal (None) bila blok tak ditemukan lagi atau
-/// fence-nya ter-indentasi (mis. di dalam list — belum didukung).
-fn splice_md_block(md: &str, index: usize, src: &str) -> Option<String> {
-    let (_, range) = mermaid_blocks(md).into_iter().nth(index)?;
-    let block = &md[range.clone()];
-    let open_len = block.find('\n')?;
-    let close_start = block.rfind('\n')?;
-    let (open, close) = (&block[..open_len], &block[close_start + 1..]);
-    // Kedua baris harus benar-benar fence TANPA indentasi: fence di
-    // dalam list menuntut re-indentasi isi (belum didukung), dan
-    // fence tak tertutup di EOF membuat baris terakhir = konten.
-    let fence = |s: &str| s.starts_with("```") || s.starts_with("~~~");
-    if !fence(open) || !fence(close) {
-        return None;
-    }
-    let mut out = String::with_capacity(md.len() + src.len());
-    out.push_str(&md[..range.start]);
-    out.push_str(open);
-    out.push('\n');
-    out.push_str(src.trim_end_matches('\n'));
-    out.push('\n');
-    out.push_str(close);
-    out.push_str(&md[range.end..]);
-    Some(out)
-}
+// Ekstraksi blok ```mermaid dan tulis-balik ke fence kini milik
+// ENGINE (`flowmaid::md`, fitur `markdown`) — dibagi bersama CLI dan
+// playground web; desktop hanya menyimpan rendering egui-nya.
 
 /// Scene kosong dengan ukuran kanvas — dipakai diagram statis
 /// (pie/sequence) yang tak punya node yang bisa digeser.
@@ -3054,14 +3003,14 @@ mod tests {
         let md = "# Judul\n\nteks pembuka\n\n```mermaid\nflowchart TD\nA-->B\n```\n\n\
                   paragraf tengah\n\n```js\nconsole.log(1)\n```\n\n\
                   ~~~mermaid\npie\n\"x\" : 1\n~~~\n\npenutup\n";
-        // Ekstraksi: dua blok mermaid, fence js dilewati.
-        let blocks = mermaid_blocks(md);
+        // Ekstraksi (via engine): dua blok mermaid, fence js dilewati.
+        let blocks = flowmaid::md::mermaid_blocks(md);
         assert_eq!(blocks.len(), 2);
-        assert!(blocks[0].0.starts_with("flowchart TD"));
-        assert!(blocks[1].0.starts_with("pie"));
+        assert!(blocks[0].source.starts_with("flowchart TD"));
+        assert!(blocks[1].source.starts_with("pie"));
 
         // Splice mengganti isi blok #2 tanpa menyentuh sekitarnya.
-        let out = splice_md_block(md, 1, "pie\n\"y\" : 9").unwrap();
+        let out = flowmaid::md::splice_block(md, 1, "pie\n\"y\" : 9").unwrap();
         assert!(out.contains("~~~mermaid\npie\n\"y\" : 9\n~~~"));
         assert!(out.contains("console.log(1)") && out.contains("penutup"));
         assert!(out.contains("A-->B"), "blok #1 tak tersentuh");
