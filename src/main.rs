@@ -557,6 +557,16 @@ impl App {
             Ok(_) => {
                 self.saved_src = self.src.clone();
                 self.status = format!("tersimpan: {}", p.display());
+                // Explorer membaca dari dir_cache — tanpa invalidasi,
+                // file baru hasil Simpan-Sebagai tak pernah muncul di
+                // pohon sampai "Segarkan" manual (temuan bug hunt).
+                if let Some(parent) = p.parent() {
+                    self.dir_cache.remove(parent);
+                    // Path pohon ter-canonicalize; path simpan belum tentu.
+                    if let Ok(canon) = std::fs::canonicalize(parent) {
+                        self.dir_cache.remove(&canon);
+                    }
+                }
                 true
             }
             Err(e) => {
@@ -1052,10 +1062,24 @@ impl App {
         //    latar putih ekspor SVG. Tanpa ini, label yang digambar
         //    langsung di latar (pesan/frame sequence, legenda pie)
         //    memakai teks gelap di atas tema gelap = tak terbaca.
+        //    Batasnya bbox konten aktual, bukan (0,0)..(w,h): engine
+        //    hanya menumbuhkan w/h ke arah positif, jadi node yang
+        //    digeser ke kiri/atas titik nol tetap harus di atas kertas.
         let painter = ui.painter();
         if self.scn.width > 0.0 && self.scn.height > 0.0 {
-            let paper = Rect::from_min_max(ts(0.0, 0.0), ts(self.scn.width, self.scn.height))
-                .expand(16.0 * zoom);
+            let (mut x0, mut y0, mut x1, mut y1) =
+                (0.0f64, 0.0f64, self.scn.width, self.scn.height);
+            for n in &self.scn.nodes {
+                x0 = x0.min(n.x - n.w / 2.0);
+                y0 = y0.min(n.y - n.h / 2.0);
+                x1 = x1.max(n.x + n.w / 2.0);
+                y1 = y1.max(n.y + n.h / 2.0);
+            }
+            for c in &self.scn.clusters {
+                x0 = x0.min(c.x);
+                y0 = y0.min(c.y);
+            }
+            let paper = Rect::from_min_max(ts(x0, y0), ts(x1, y1)).expand(16.0 * zoom);
             painter.rect(
                 paper,
                 8.0 * zoom,
@@ -1530,16 +1554,19 @@ fn blank_scene(width: f64, height: f64) -> Scene {
 }
 
 /// Garis putus-putus lurus (egui tak punya dash bawaan) dalam
-/// koordinat layar.
-fn dashed_line(p: &egui::Painter, a: Pos2, b: Pos2, stroke: Stroke) {
+/// koordinat layar. `dash`/`gap` dalam piksel layar — pemanggil
+/// mengalikan zoom supaya ritme dash cocok dengan `stroke-dasharray`
+/// SVG pada level zoom berapa pun (paritas per elemen: lifeline 4/4,
+/// divider 5/4, pesan 6/4 — temuan bug hunt).
+fn dashed_line(p: &egui::Painter, a: Pos2, b: Pos2, stroke: Stroke, dash: f32, gap: f32) {
     let len = (b - a).length();
     let dir = (b - a) / len.max(0.001);
-    let (dash, gap) = (5.0, 4.0);
+    let step = (dash + gap).max(0.5); // jaga-jaga zoom ekstrem kecil
     let mut d = 0.0;
     while d < len {
         let s1 = a + dir * (d + dash).min(len);
         p.line_segment([a + dir * d, s1], stroke);
-        d += dash + gap;
+        d += step;
     }
 }
 
@@ -1605,12 +1632,15 @@ fn draw_pie(
 }
 
 /// One pie sector, tessellated as a triangle fan from the centre
-/// (valid for any sweep, unlike a single convex polygon), with white
-/// radial separators mirroring the SVG slice strokes.
+/// (valid for any sweep, unlike a single convex polygon), with the
+/// full white outline (radial edges + arc rim) mirroring the SVG
+/// slice stroke.
 fn draw_wedge(p: &egui::Painter, center: Pos2, r: f32, a0: f64, a1: f64, color: Color32, zoom: f32) {
+    let white = Stroke::new(1.5 * zoom, Color32::WHITE);
     let span = a1 - a0;
     if span >= std::f64::consts::TAU - 1e-6 {
-        p.circle_filled(center, r, color);
+        // Paritas SVG: <circle ... stroke="#ffffff" stroke-width="1.5">.
+        p.circle(center, r, color, white);
         return;
     }
     let steps = ((span / 0.15).ceil() as usize).max(1);
@@ -1623,9 +1653,10 @@ fn draw_wedge(p: &egui::Painter, center: Pos2, r: f32, a0: f64, a1: f64, color: 
             color,
             Stroke::NONE,
         ));
+        // Rim busur ikut di-stroke putih, seperti path SVG-nya.
+        p.line_segment([prev, cur], white);
         prev = cur;
     }
-    let white = Stroke::new(1.5 * zoom, Color32::WHITE);
     p.line_segment([center, pt(a0)], white);
     p.line_segment([center, pt(a1)], white);
 }
@@ -1651,7 +1682,8 @@ fn draw_sequence(
     }
     // Lifelines (dashed) + activation bars.
     for l in &sc.lifelines {
-        dashed_line(p, ts(l.x, l.y0), ts(l.x, l.y1), Stroke::new(1.0 * zoom, guide));
+        let s = Stroke::new(1.0 * zoom, guide);
+        dashed_line(p, ts(l.x, l.y0), ts(l.x, l.y1), s, 4.0 * zoom, 4.0 * zoom);
     }
     for a in &sc.activations {
         p.rect(
@@ -1688,7 +1720,8 @@ fn draw_sequence(
             );
         }
         for (dy, dl) in &f.dividers {
-            dashed_line(p, ts(f.x, *dy), ts(f.x + f.w, *dy), Stroke::new(1.0 * zoom, guide));
+            let s = Stroke::new(1.0 * zoom, guide);
+            dashed_line(p, ts(f.x, *dy), ts(f.x + f.w, *dy), s, 5.0 * zoom, 4.0 * zoom);
             if !dl.is_empty() {
                 p.text(
                     ts(f.x + f.w / 2.0, dy + 12.0),
@@ -1724,7 +1757,7 @@ fn draw_sequence(
         for w in m.points.windows(2) {
             let (a, b) = (ts(w[0].0, w[0].1), ts(w[1].0, w[1].1));
             if m.dashed {
-                dashed_line(p, a, b, stroke);
+                dashed_line(p, a, b, stroke, 6.0 * zoom, 4.0 * zoom);
             } else {
                 p.line_segment([a, b], stroke);
             }
@@ -1965,5 +1998,26 @@ mod tests {
         a.src = "flowchart TD\nX --> Y".into();
         a.reparse();
         assert!(a.pie.is_none() && a.seq.is_none());
+    }
+
+    #[test]
+    fn explorer_sees_file_the_app_just_saved() {
+        // Bug hunt: write_to tidak meng-invalidasi dir_cache, jadi
+        // file hasil Simpan-Sebagai tak pernah muncul di explorer
+        // sampai "Segarkan" manual.
+        let mut a = app();
+        let dir = std::env::temp_dir().join(format!("flowmaid-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.mmd"), "A-->B").unwrap();
+        let names = |l: &Rc<Result<Vec<TreeEntry>, String>>| -> Vec<String> {
+            l.as_ref().as_ref().unwrap().iter().map(|t| t.name.clone()).collect()
+        };
+        assert_eq!(names(&a.listing(&dir)), ["a.mmd"], "cache primed");
+        assert!(a.write_to(&dir.join("b.mmd")), "save into the cached folder");
+        assert!(
+            names(&a.listing(&dir)).contains(&"b.mmd".to_string()),
+            "explorer must show the file the app just saved"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
