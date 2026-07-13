@@ -1865,17 +1865,22 @@ struct Run {
     strong: bool,
     em: bool,
     code: bool,
-    link: bool,
+    strike: bool,
+    /// Some = tautan yang bisa diklik (URL tujuan).
+    url: Option<String>,
 }
 
 /// Satu elemen blok dokumen Markdown ter-render.
 enum MdItem {
     Heading(u8, Vec<Run>),
     Para(Vec<Run>),
-    /// (kedalaman indent, nomor urut bila ordered, isi)
-    Bullet(u8, Option<u64>, Vec<Run>),
+    /// (kedalaman indent, nomor urut bila ordered,
+    ///  centang task-list bila ada, isi)
+    Bullet(u8, Option<u64>, Option<bool>, Vec<Run>),
     Quote(Vec<Run>),
     CodeBlock(String),
+    /// Baris-baris tabel GFM; baris pertama = header.
+    Table(Vec<Vec<Vec<Run>>>),
     /// Indeks ke [`MdDoc::blocks`].
     Diagram(usize),
     Rule,
@@ -1893,44 +1898,49 @@ struct MdDoc {
 fn build_mdoc(md: &str) -> MdDoc {
     use markdown::mdast::Node;
 
-    fn runs(nodes: &[Node], out: &mut Vec<Run>, strong: bool, em: bool, code: bool, link: bool) {
+    #[derive(Clone, Default)]
+    struct Style {
+        strong: bool,
+        em: bool,
+        code: bool,
+        strike: bool,
+        url: Option<String>,
+    }
+    fn push(out: &mut Vec<Run>, text: String, st: &Style) {
+        out.push(Run {
+            text,
+            strong: st.strong,
+            em: st.em,
+            code: st.code,
+            strike: st.strike,
+            url: st.url.clone(),
+        });
+    }
+    fn runs(nodes: &[Node], out: &mut Vec<Run>, st: &Style) {
         for n in nodes {
             match n {
-                Node::Text(t) => out.push(Run {
-                    text: t.value.clone(),
-                    strong,
-                    em,
-                    code,
-                    link,
-                }),
-                Node::InlineCode(c) => out.push(Run {
-                    text: c.value.clone(),
-                    strong,
-                    em,
-                    code: true,
-                    link,
-                }),
-                Node::Strong(s) => runs(&s.children, out, true, em, code, link),
-                Node::Emphasis(e) => runs(&e.children, out, strong, true, code, link),
-                Node::Link(l) => runs(&l.children, out, strong, em, code, true),
-                Node::Delete(d) => runs(&d.children, out, strong, em, code, link),
-                Node::Break(_) => out.push(Run {
-                    text: "\n".into(),
-                    strong,
-                    em,
-                    code,
-                    link,
-                }),
-                Node::Image(i) => out.push(Run {
-                    text: format!("[gambar: {}]", i.alt),
-                    strong,
-                    em: true,
-                    code,
-                    link,
-                }),
+                Node::Text(t) => push(out, t.value.clone(), st),
+                Node::InlineCode(c) => {
+                    push(out, c.value.clone(), &Style { code: true, ..st.clone() })
+                }
+                Node::Strong(s) => runs(&s.children, out, &Style { strong: true, ..st.clone() }),
+                Node::Emphasis(e) => runs(&e.children, out, &Style { em: true, ..st.clone() }),
+                Node::Delete(d) => runs(&d.children, out, &Style { strike: true, ..st.clone() }),
+                Node::Link(l) => runs(
+                    &l.children,
+                    out,
+                    &Style { url: Some(l.url.clone()), ..st.clone() },
+                ),
+                Node::Break(_) => push(out, "\n".into(), st),
+                Node::Image(i) => {
+                    push(out, format!("[gambar: {}]", i.alt), &Style { em: true, ..st.clone() })
+                }
+                Node::FootnoteReference(f) => {
+                    push(out, format!("[^{}]", f.identifier), &Style { em: true, ..st.clone() })
+                }
                 other => {
                     if let Some(ch) = other.children() {
-                        runs(ch, out, strong, em, code, link);
+                        runs(ch, out, st);
                     }
                 }
             }
@@ -1938,23 +1948,14 @@ fn build_mdoc(md: &str) -> MdDoc {
     }
     fn inline(nodes: &[Node]) -> Vec<Run> {
         let mut v = Vec::new();
-        runs(nodes, &mut v, false, false, false, false);
+        runs(nodes, &mut v, &Style::default());
         v
     }
     fn walk(nodes: &[Node], doc: &mut MdDoc, depth: u8) {
         for n in nodes {
             match n {
                 Node::Heading(h) => doc.items.push(MdItem::Heading(h.depth, inline(&h.children))),
-                Node::Paragraph(p) => {
-                    let r = inline(&p.children);
-                    if depth == 0 {
-                        doc.items.push(MdItem::Para(r));
-                    } else {
-                        // Paragraf di dalam list item digambar oleh
-                        // cabang List di bawah; tak sampai ke sini.
-                        doc.items.push(MdItem::Para(r));
-                    }
-                }
+                Node::Paragraph(p) => doc.items.push(MdItem::Para(inline(&p.children))),
                 Node::Code(c) => {
                     let lang = c.lang.as_deref().unwrap_or("");
                     if lang.eq_ignore_ascii_case("mermaid") || lang.eq_ignore_ascii_case("mmd") {
@@ -1969,30 +1970,68 @@ fn build_mdoc(md: &str) -> MdDoc {
                     let mut num = l.start.map(u64::from);
                     for item in &l.children {
                         if let Node::ListItem(li) = item {
-                            // Baris pertama item = paragraf pertamanya.
-                            let mut lead: Vec<Run> = Vec::new();
+                            // Baris pertama item = paragraf pertamanya;
+                            // centang GFM (- [x]) ikut dibawa.
+                            let mut lead: Option<Vec<Run>> = None;
                             for ch in &li.children {
-                                match ch {
-                                    Node::Paragraph(p) if lead.is_empty() => {
-                                        lead = inline(&p.children)
+                                if let Node::Paragraph(p) = ch {
+                                    if lead.is_none() {
+                                        lead = Some(inline(&p.children));
                                     }
-                                    Node::List(_) => {}
-                                    _ => {}
                                 }
                             }
-                            doc.items.push(MdItem::Bullet(depth, num, lead));
+                            doc.items.push(MdItem::Bullet(
+                                depth,
+                                num,
+                                li.checked,
+                                lead.unwrap_or_default(),
+                            ));
                             if let Some(k) = num.as_mut() {
                                 *k += 1;
                             }
-                            // List bersarang di dalam item.
+                            // Anak lain di dalam item: list bersarang
+                            // turun satu level indent; blok lain (code,
+                            // kutipan, paragraf ke-2+) ikut dirender —
+                            // dulu diam-diam hilang (lebar penuh, indent
+                            // belum dipertahankan).
+                            let mut first_para_seen = false;
                             for ch in &li.children {
-                                if matches!(ch, Node::List(_)) {
-                                    walk(std::slice::from_ref(ch), doc, depth + 1);
+                                match ch {
+                                    Node::Paragraph(_) if !first_para_seen => {
+                                        first_para_seen = true;
+                                    }
+                                    Node::List(_) => {
+                                        walk(std::slice::from_ref(ch), doc, depth + 1)
+                                    }
+                                    other => walk(std::slice::from_ref(other), doc, depth),
                                 }
                             }
                         }
                     }
                 }
+                Node::Table(t) => {
+                    // Baris pertama = header (mdast GFM).
+                    let rows: Vec<Vec<Vec<Run>>> = t
+                        .children
+                        .iter()
+                        .filter_map(|row| match row {
+                            Node::TableRow(r) => Some(
+                                r.children
+                                    .iter()
+                                    .filter_map(|cell| match cell {
+                                        Node::TableCell(c) => Some(inline(&c.children)),
+                                        _ => None,
+                                    })
+                                    .collect(),
+                            ),
+                            _ => None,
+                        })
+                        .collect();
+                    if !rows.is_empty() {
+                        doc.items.push(MdItem::Table(rows));
+                    }
+                }
+                Node::Html(h) => doc.items.push(MdItem::CodeBlock(h.value.clone())),
                 Node::Blockquote(b) => {
                     for ch in &b.children {
                         if let Node::Paragraph(p) = ch {
@@ -2015,7 +2054,7 @@ fn build_mdoc(md: &str) -> MdDoc {
         blocks: Vec::new(),
         block_srcs: Vec::new(),
     };
-    if let Ok(ast) = markdown::to_mdast(md, &markdown::ParseOptions::default()) {
+    if let Ok(ast) = markdown::to_mdast(md, &md_parse_options()) {
         if let Some(children) = ast.children() {
             walk(children, &mut doc, 0);
         }
@@ -2024,7 +2063,7 @@ fn build_mdoc(md: &str) -> MdDoc {
 }
 
 /// Susun potongan-potongan inline menjadi satu LayoutJob bergaya
-/// (tebal/miring/kode/tautan), memakai warna tema aktif.
+/// (tebal/miring/kode/coret/tautan), memakai warna tema aktif.
 fn runs_job(ui: &egui::Ui, runs: &[Run], size: f32, all_strong: bool) -> egui::text::LayoutJob {
     use egui::text::{LayoutJob, TextFormat};
     let mut job = LayoutJob::default();
@@ -2047,13 +2086,54 @@ fn runs_job(ui: &egui::Ui, runs: &[Run], size: f32, all_strong: bool) -> egui::t
         if r.code {
             fmt.background = ui.visuals().code_bg_color;
         }
-        if r.link {
+        if r.strike {
+            fmt.strikethrough = Stroke::new(1.0, fmt.color);
+        }
+        if r.url.is_some() {
             fmt.color = ui.visuals().hyperlink_color;
             fmt.underline = Stroke::new(1.0, ui.visuals().hyperlink_color);
         }
         job.append(&r.text, 0.0, fmt);
     }
     job
+}
+
+/// Gambar satu kumpulan run. Tanpa tautan → satu label (wrapping
+/// paling mulus); ada tautan → segmen-segmen inline dan tautannya
+/// jadi hyperlink sungguhan (klik membuka browser).
+fn draw_runs(ui: &mut egui::Ui, runs: &[Run], size: f32, all_strong: bool) {
+    if runs.iter().all(|r| r.url.is_none()) {
+        ui.label(runs_job(ui, runs, size, all_strong));
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let mut plain: Vec<Run> = Vec::new();
+        let flush = |ui: &mut egui::Ui, buf: &mut Vec<Run>| {
+            if !buf.is_empty() {
+                let job = runs_job(ui, buf, size, all_strong);
+                ui.label(job);
+                buf.clear();
+            }
+        };
+        for r in runs {
+            match &r.url {
+                Some(url) => {
+                    flush(ui, &mut plain);
+                    ui.hyperlink_to(r.text.clone(), url.clone());
+                }
+                None => plain.push(Run {
+                    text: r.text.clone(),
+                    strong: r.strong,
+                    em: r.em,
+                    code: r.code,
+                    strike: r.strike,
+                    url: None,
+                }),
+            }
+        }
+        flush(ui, &mut plain);
+    });
 }
 
 /// Gambar satu elemen dokumen Markdown. Klik "edit sebagai tab" pada
@@ -2063,25 +2143,33 @@ fn draw_md_item(ui: &mut egui::Ui, item: &MdItem, mdoc: &MdDoc, open_req: &mut O
         MdItem::Heading(depth, runs) => {
             let size = [24.0, 20.0, 17.0, 15.0, 14.0, 13.5][(*depth as usize - 1).min(5)];
             ui.add_space(if *depth <= 2 { 14.0 } else { 10.0 });
-            ui.label(runs_job(ui, runs, size, true));
+            draw_runs(ui, runs, size, true);
             if *depth <= 2 {
                 ui.separator();
             }
             ui.add_space(4.0);
         }
         MdItem::Para(runs) => {
-            ui.label(runs_job(ui, runs, 14.0, false));
+            draw_runs(ui, runs, 14.0, false);
             ui.add_space(8.0);
         }
-        MdItem::Bullet(depth, num, runs) => {
+        MdItem::Bullet(depth, num, checked, runs) => {
             ui.horizontal_top(|ui| {
                 ui.add_space(10.0 + *depth as f32 * 18.0);
-                let marker = match num {
-                    Some(k) => format!("{k}."),
-                    None => "•".to_string(),
-                };
-                ui.label(egui::RichText::new(marker).size(14.0));
-                ui.label(runs_job(ui, runs, 14.0, false));
+                match (checked, num) {
+                    // Task list GFM: kotak centang (read-only).
+                    (Some(done), _) => {
+                        let mut v = *done;
+                        ui.add_enabled(false, egui::Checkbox::without_text(&mut v));
+                    }
+                    (None, Some(k)) => {
+                        ui.label(egui::RichText::new(format!("{k}.")).size(14.0));
+                    }
+                    (None, None) => {
+                        ui.label(egui::RichText::new("•").size(14.0));
+                    }
+                }
+                draw_runs(ui, runs, 14.0, false);
             });
             ui.add_space(3.0);
         }
@@ -2091,7 +2179,28 @@ fn draw_md_item(ui: &mut egui::Ui, item: &MdItem, mdoc: &MdDoc, open_req: &mut O
                 .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                 .rounding(4.0)
                 .show(ui, |ui| {
-                    ui.label(runs_job(ui, runs, 14.0, false));
+                    draw_runs(ui, runs, 14.0, false);
+                });
+            ui.add_space(8.0);
+        }
+        MdItem::Table(rows) => {
+            egui::Frame::none()
+                .stroke(Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+                .inner_margin(egui::Margin::same(8.0))
+                .rounding(6.0)
+                .show(ui, |ui| {
+                    egui::Grid::new(rows.as_ptr())
+                        .striped(true)
+                        .spacing([18.0, 6.0])
+                        .show(ui, |ui| {
+                            for (ri, row) in rows.iter().enumerate() {
+                                for cell in row {
+                                    // Baris pertama = header (ditebalkan).
+                                    draw_runs(ui, cell, 13.5, ri == 0);
+                                }
+                                ui.end_row();
+                            }
+                        });
                 });
             ui.add_space(8.0);
         }
@@ -2486,6 +2595,14 @@ fn draw_card(
     );
 }
 
+/// Opsi parse Markdown BERSAMA untuk seluruh app (GFM: tabel, task
+/// list, strikethrough, autolink). Ekstraksi blok dan tampilan
+/// dokumen harus memakai opsi yang sama — kalau tidak, indeks blok
+/// di tampilan bisa bergeser dari indeks yang dipakai splice-save.
+fn md_parse_options() -> markdown::ParseOptions {
+    markdown::ParseOptions::gfm()
+}
+
 /// Blok ```mermaid di sebuah dokumen Markdown, diekstrak lewat AST
 /// crate `markdown` (bukan regex — fence bertilde, di dalam quote,
 /// dan info-string tetap terdeteksi benar). Tiap entri: isi blok +
@@ -2507,7 +2624,7 @@ fn mermaid_blocks(md: &str) -> Vec<(String, std::ops::Range<usize>)> {
         }
     }
     let mut out = Vec::new();
-    if let Ok(ast) = markdown::to_mdast(md, &markdown::ParseOptions::default()) {
+    if let Ok(ast) = markdown::to_mdast(md, &md_parse_options()) {
         walk(&ast, &mut out);
     }
     out
@@ -3104,6 +3221,45 @@ mod tests {
         assert_eq!(a.docs.len(), 2, "dokumen sudah terbuka → pindah saja");
         assert!(a.mdoc.is_some(), "kembali ke tab dokumen");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gfm_tables_tasks_strike_and_links_render() {
+        let md = "# T\n\n~~coret~~ dan [tautan](https://x.dev) di sini\n\n\
+                  | Kolom A | Kolom B |\n|---|---|\n| a1 | b1 |\n| a2 | b2 |\n\n\
+                  - [x] beres\n- [ ] belum\n- biasa\n  ```mermaid\n  A-->B\n  ```\n";
+        let doc = build_mdoc(md);
+        // Strikethrough + URL sampai ke Run.
+        let para = doc.items.iter().find_map(|i| match i {
+            MdItem::Para(r) => Some(r),
+            _ => None,
+        });
+        let para = para.expect("paragraf ada");
+        assert!(para.iter().any(|r| r.strike && r.text.contains("coret")));
+        assert!(para
+            .iter()
+            .any(|r| r.url.as_deref() == Some("https://x.dev")));
+        // Tabel GFM: 3 baris (header + 2), 2 kolom.
+        let table = doc.items.iter().find_map(|i| match i {
+            MdItem::Table(rows) => Some(rows),
+            _ => None,
+        });
+        let table = table.expect("tabel ter-parse (GFM aktif)");
+        assert_eq!((table.len(), table[0].len()), (3, 2));
+        // Task list: centang terbawa; item biasa tanpa centang.
+        let checks: Vec<Option<bool>> = doc
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                MdItem::Bullet(_, _, c, _) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(checks, [Some(true), Some(false), None]);
+        // Code block mermaid DI DALAM list item tak lagi hilang —
+        // ia jadi diagram (fence ter-indentasi tetap ditolak splice,
+        // tapi rendering-nya jalan).
+        assert_eq!(doc.blocks.len(), 1, "diagram dalam list item ditemukan");
     }
 
     #[test]
