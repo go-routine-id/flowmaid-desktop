@@ -251,6 +251,8 @@ struct Doc {
     pie_labels: Vec<Option<String>>,
     pie_empty: bool,
     seq_labels: Vec<String>,
+    /// Some = tab ini DOKUMEN Markdown ter-render (bukan diagram).
+    mdoc: Option<MdDoc>,
     error: Option<String>,
     zoom: f32,
     pan: Vec2,
@@ -276,6 +278,7 @@ impl Doc {
             pie_labels: Vec::new(),
             pie_empty: false,
             seq_labels: Vec::new(),
+            mdoc: None,
             error: None,
             zoom: 1.0,
             pan: Vec2::ZERO,
@@ -319,6 +322,7 @@ struct App {
     pie_labels: Vec<Option<String>>, // "NN%" per slice; None = terlalu tipis
     pie_empty: bool,                 // total 0 → outline saja
     seq_labels: Vec<String>,         // label pesan final ("N. teks" / teks)
+    mdoc: Option<MdDoc>,             // Some = tab dokumen Markdown ter-render
     error: Option<String>,
     status: String,
     zoom: f32,         // faktor zoom kanvas (1.0 = 100%)
@@ -368,6 +372,7 @@ impl App {
             pie_labels: Vec::new(),
             pie_empty: false,
             seq_labels: Vec::new(),
+            mdoc: None,
             error: None,
             status: "geser node dengan mouse".into(),
             zoom: 1.0,
@@ -386,6 +391,18 @@ impl App {
     /// ditemukan) — saat mengetik biasa semua kunci ketemu, jadi
     /// keystroke tidak membayar layout penuh yang langsung dibuang.
     fn reparse(&mut self) {
+        // Dokumen Markdown dirender sebagai DOKUMEN (heading, teks,
+        // diagram inline) — bukan diparse sebagai diagram.
+        if self.path_is_markdown() {
+            self.mdoc = Some(build_mdoc(&self.src));
+            self.model = Model::Flow(Graph::default());
+            self.pos = Vec::new();
+            self.clear_aux();
+            self.scn = blank_scene(0.0, 0.0);
+            self.error = None;
+            return;
+        }
+        self.mdoc = None;
         match flowmaid::parser::parse_document(&self.src) {
             Ok(doc) => {
                 // Model lama ditahan hidup di lokal supaya peta posisi
@@ -607,6 +624,7 @@ impl App {
         d.pie_labels = std::mem::take(&mut self.pie_labels);
         d.pie_empty = self.pie_empty;
         d.seq_labels = std::mem::take(&mut self.seq_labels);
+        d.mdoc = self.mdoc.take();
         d.error = self.error.take();
         d.zoom = self.zoom;
         d.pan = self.pan;
@@ -633,6 +651,7 @@ impl App {
         self.pie_labels = std::mem::take(&mut d.pie_labels);
         self.pie_empty = d.pie_empty;
         self.seq_labels = std::mem::take(&mut d.seq_labels);
+        self.mdoc = d.mdoc.take();
         self.error = d.error.take();
         self.zoom = d.zoom;
         self.pan = d.pan;
@@ -724,19 +743,22 @@ impl App {
             });
     }
 
+    /// Dokumen aktif adalah file Markdown? (mode dokumen ter-render)
+    fn path_is_markdown(&self) -> bool {
+        self.path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .map(|e| {
+                let e = e.to_string_lossy().to_lowercase();
+                e == "md" || e == "markdown"
+            })
+            .unwrap_or(false)
+    }
+
     fn open_path(&mut self, p: PathBuf) {
         // Canonicalize agar cocok dengan path pohon explorer
         // (highlight file aktif) dan untuk dedupe antar-tab.
         let p = std::fs::canonicalize(&p).unwrap_or(p);
-        // File Markdown: ekstrak blok ```mermaid-nya jadi tab.
-        let ext = p
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        if ext == "md" || ext == "markdown" {
-            self.open_markdown(p);
-            return;
-        }
         // Sudah terbuka? Aktifkan tabnya saja.
         if self.path.as_ref() == Some(&p) {
             return;
@@ -760,66 +782,51 @@ impl App {
                 }
                 self.src = t;
                 self.saved_src = self.src.clone();
+                // Path di-set SEBELUM reparse — mode dokumen Markdown
+                // ditentukan dari ekstensinya.
+                self.path = Some(p.clone());
                 self.reparse();
                 self.reset_view();
                 self.status = format!("dibuka: {}", p.display());
                 self.push_recent(&p);
-                self.path = Some(p);
             }
             Err(e) => self.status = format!("gagal membuka: {}", e),
         }
     }
 
-    /// Buka file Markdown: tiap blok ```mermaid menjadi satu tab.
+    /// Buka SATU blok ```mermaid dari file Markdown sebagai tab
+    /// diagram tersendiri (tombol "edit" di tampilan dokumen).
     /// Menyimpan tab tersebut menulis balik ke dalam fence-nya.
-    fn open_markdown(&mut self, p: PathBuf) {
-        let md = match std::fs::read_to_string(&p) {
-            Ok(t) => t,
-            Err(e) => {
-                self.status = format!("gagal membuka: {}", e);
-                return;
-            }
+    fn open_md_block(&mut self, host: &Path, index: usize, src: String) {
+        let host_eq = |h: &Option<MdHost>| {
+            h.as_ref().is_some_and(|h| h.path == host && h.index == index)
         };
-        let blocks = mermaid_blocks(&md);
-        if blocks.is_empty() {
-            self.status = format!("tidak ada blok ```mermaid di {}", p.display());
+        // Dedupe: blok ini sudah punya tab? Aktifkan saja.
+        if host_eq(&self.md_host) {
             return;
         }
-        let host_eq = |h: &Option<MdHost>, i: usize| {
-            h.as_ref().is_some_and(|h| h.path == p && h.index == i)
-        };
-        let n = blocks.len();
-        let mut first_new: Option<usize> = None;
-        for (i, (src, _)) in blocks.into_iter().enumerate() {
-            // Dedupe: blok ini sudah punya tab? (aktif atau parkiran)
-            if host_eq(&self.md_host, i)
-                || self.docs.iter().enumerate().any(|(t, d)| t != self.active && host_eq(&d.md_host, i))
-            {
-                continue;
-            }
-            if !self.active_is_pristine_untitled() {
-                self.park();
-                self.docs.push(Doc::empty());
-                self.active = self.docs.len() - 1;
-            }
-            self.src = src;
-            self.saved_src = self.src.clone();
-            self.path = None;
-            self.md_host = Some(MdHost { path: p.clone(), index: i });
-            self.reparse();
-            self.reset_view();
-            first_new.get_or_insert(self.active);
-        }
-        // Fokus ke blok pertama file ini (baru maupun sudah ada).
-        let target = first_new.or_else(|| {
-            (0..self.docs.len())
-                .find(|&t| host_eq(if t == self.active { &self.md_host } else { &self.docs[t].md_host }, 0))
-        });
-        if let Some(t) = target {
+        if let Some(t) = (0..self.docs.len())
+            .filter(|&t| t != self.active)
+            .find(|&t| host_eq(&self.docs[t].md_host))
+        {
             self.switch_to(t);
+            return;
         }
-        self.status = format!("{}: {} blok mermaid", p.display(), n);
-        self.push_recent(&p);
+        if !self.active_is_pristine_untitled() {
+            self.park();
+            self.docs.push(Doc::empty());
+            self.active = self.docs.len() - 1;
+        }
+        self.src = src;
+        self.saved_src = self.src.clone();
+        self.path = None;
+        self.md_host = Some(MdHost {
+            path: host.to_path_buf(),
+            index,
+        });
+        self.reparse();
+        self.reset_view();
+        self.status = format!("blok #{} dari {}", index + 1, host.display());
     }
 
     /// Tab baru berisi contoh bawaan.
@@ -1359,17 +1366,20 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.view, View::Split, "Split");
                 ui.selectable_value(&mut self.view, View::Code, "Code");
                 ui.separator();
-                if ui
-                    .button("Tata ulang")
-                    .on_hover_text("tata letak otomatis")
-                    .clicked()
-                {
-                    self.autolayout();
+                // Aksi kanvas tak relevan untuk tab dokumen Markdown.
+                if self.mdoc.is_none() {
+                    if ui
+                        .button("Tata ulang")
+                        .on_hover_text("tata letak otomatis")
+                        .clicked()
+                    {
+                        self.autolayout();
+                    }
+                    if ui.button("Ekspor SVG").clicked() {
+                        self.export_svg_file();
+                    }
                 }
-                if ui.button("Ekspor SVG").clicked() {
-                    self.export_svg_file();
-                }
-                if self.view != View::Code {
+                if self.view != View::Code && self.mdoc.is_none() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         if ui.small_button("+").clicked() {
@@ -1411,16 +1421,20 @@ impl eframe::App for App {
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let kind = match &self.model {
-                            Model::Flow(g) => {
-                                format!("flowchart · {} node", g.nodes.len())
+                        let kind = if let Some(m) = &self.mdoc {
+                            format!("markdown · {} diagram", m.blocks.len())
+                        } else {
+                            match &self.model {
+                                Model::Flow(g) => {
+                                    format!("flowchart · {} node", g.nodes.len())
+                                }
+                                Model::Er(d) => format!("ER · {} entitas", d.entities.len()),
+                                Model::Class(d) => format!("class · {} kelas", d.classes.len()),
+                                Model::Sequence(d) => {
+                                    format!("sequence · {} partisipan", d.participants.len())
+                                }
+                                Model::Pie(d) => format!("pie · {} slice", d.slices.len()),
                             }
-                            Model::Er(d) => format!("ER · {} entitas", d.entities.len()),
-                            Model::Class(d) => format!("class · {} kelas", d.classes.len()),
-                            Model::Sequence(d) => {
-                                format!("sequence · {} partisipan", d.participants.len())
-                            }
-                            Model::Pie(d) => format!("pie · {} slice", d.slices.len()),
                         };
                         ui.weak(kind);
                     });
@@ -1465,8 +1479,44 @@ impl App {
         });
     }
 
+    /// Dokumen Markdown ter-render: heading/teks/list/kutipan/kode
+    /// plus tiap blok ```mermaid dilukis inline sebagai diagram.
+    fn draw_document(&mut self, ui: &mut egui::Ui) {
+        // Ambil-sementara supaya iterasi item tak bentrok dengan
+        // aksi tombol yang butuh &mut self.
+        let Some(mdoc) = self.mdoc.take() else { return };
+        let mut open_req: Option<usize> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::symmetric(20.0, 16.0))
+                    .show(ui, |ui| {
+                        ui.set_max_width(860.0);
+                        for item in &mdoc.items {
+                            draw_md_item(ui, item, &mdoc, &mut open_req);
+                        }
+                        ui.add_space(24.0);
+                    });
+            });
+        self.mdoc = Some(mdoc);
+        if let Some(i) = open_req {
+            if let (Some(host), Some(src)) = (
+                self.path.clone(),
+                self.mdoc.as_ref().and_then(|m| m.block_srcs.get(i)).cloned(),
+            ) {
+                self.open_md_block(&host, i, src);
+            }
+        }
+    }
+
     /// Kanvas diagram interaktif (tab Preview / sisi Split).
     fn draw_canvas(&mut self, ui: &mut egui::Ui) {
+        // Tab dokumen Markdown memakai tampilan dokumen, bukan kanvas.
+        if self.mdoc.is_some() {
+            self.draw_document(ui);
+            return;
+        }
         let canvas = ui.max_rect();
         self.canvas_size = canvas.size();
 
@@ -1515,160 +1565,22 @@ impl App {
             self.reroute();
         }
 
-        // 2) "Kertas" putih seukuran kanvas diagram — cermin persis
-        //    latar putih ekspor SVG. Tanpa ini, label yang digambar
-        //    langsung di latar (pesan/frame sequence, legenda pie)
-        //    memakai teks gelap di atas tema gelap = tak terbaca.
-        //    Batasnya bbox konten aktual, bukan (0,0)..(w,h): engine
-        //    hanya menumbuhkan w/h ke arah positif, jadi node yang
-        //    digeser ke kiri/atas titik nol tetap harus di atas kertas.
+        // 2) Lukis diagram lewat fungsi bersama (juga dipakai
+        //    pratinjau inline dokumen Markdown).
         let painter = ui.painter();
-        if self.scn.width > 0.0 && self.scn.height > 0.0 {
-            let (mut x0, mut y0, mut x1, mut y1) =
-                (0.0f64, 0.0f64, self.scn.width, self.scn.height);
-            for n in &self.scn.nodes {
-                x0 = x0.min(n.x - n.w / 2.0);
-                y0 = y0.min(n.y - n.h / 2.0);
-                x1 = x1.max(n.x + n.w / 2.0);
-                y1 = y1.max(n.y + n.h / 2.0);
-            }
-            for c in &self.scn.clusters {
-                x0 = x0.min(c.x);
-                y0 = y0.min(c.y);
-            }
-            let paper = Rect::from_min_max(ts(x0, y0), ts(x1, y1)).expand(16.0 * zoom);
-            // Bayangan tipis supaya kertas "terangkat" dari latar.
-            painter.rect_filled(
-                paper.translate(Vec2::new(0.0, 2.5)).expand(1.5),
-                9.0 * zoom,
-                Color32::from_black_alpha(70),
-            );
-            painter.rect(
-                paper,
-                8.0 * zoom,
-                Color32::WHITE,
-                Stroke::new(1.0, LABEL_BORDER),
-            );
-        }
-
-        // 3) Gambar cluster subgraph (terluar dulu), lalu edge,
-        //    lalu node/tabel.
-        for c in &self.scn.clusters {
-            let tl = ts(c.x, c.y);
-            let rect = Rect::from_min_size(tl, Vec2::new(c.w as f32, c.h as f32) * zoom);
-            painter.rect(
-                rect,
-                8.0 * zoom,
-                Color32::from_rgb(0xf7, 0xf8, 0xfd),
-                Stroke::new(1.4 * zoom, Color32::from_rgb(0xc9, 0xcf, 0xe8)),
-            );
-            painter.text(
-                tl + Vec2::new(10.0, 11.0) * zoom,
-                Align2::LEFT_CENTER,
-                &c.title,
-                // Jaga agar judul tetap terbaca saat zoom kecil
-                // (12 × 0.5 = lantai 6 pt, tetap terkuantisasi).
-                zfont(12.0, zoom.max(0.5)),
-                TYPE_MUTED,
-            );
-        }
-        let is_er = !self.tables.is_empty();
-        let is_class = !self.boxes.is_empty();
-        for (i, e) in self.scn.edges.iter().enumerate() {
-            if matches!(e.kind, EdgeKind::Invisible) {
-                continue; // link penata layout — tidak digambar
-            }
-            let p = e.bezier.map(|(x, y)| ts(x, y));
-            let sw = (if matches!(e.kind, EdgeKind::Thick | EdgeKind::ThickOpen) {
-                3.4
-            } else {
-                1.7
-            }) * zoom;
-            let stroke = Stroke::new(sw, EDGE);
-            if matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen) {
-                dashed_bezier(painter, p, stroke);
-            } else {
-                painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
-                    p,
-                    false,
-                    Color32::TRANSPARENT,
-                    stroke,
-                ));
-            }
-            if is_class {
-                // Glyph UML di ujung `to`; kardinalitas di kedua sisi.
-                // `.get` menjaga andai edge & rels tak sejajar.
-                if let Some(rel) = self.rels.get(i) {
-                    draw_head(
-                        painter,
-                        &class::head(e.bezier[3], e.bezier[2], rel.kind),
-                        &ts,
-                        zoom,
-                    );
-                    if let Some(c) = &rel.from_card {
-                        draw_card(painter, e.bezier[0], e.bezier[1], c, &ts, zoom);
-                    }
-                    if let Some(c) = &rel.to_card {
-                        draw_card(painter, e.bezier[3], e.bezier[2], c, &ts, zoom);
-                    }
-                }
-            } else if let Some(&(cf, ct)) = self.cards.get(i).filter(|_| is_er) {
-                // Notasi crow's foot di kedua ujung relasi ER.
-                // `.get` (bukan index) menjaga andai suatu saat
-                // jumlah edge dan cards tak sejajar.
-                draw_glyph(painter, &er::glyph(e.bezier[0], e.bezier[1], cf), &ts, zoom);
-                draw_glyph(painter, &er::glyph(e.bezier[3], e.bezier[2], ct), &ts, zoom);
-            } else if e.kind.has_arrow() {
-                arrow_head(painter, p, EDGE, zoom);
-            }
-            if let Some((t, (lx, ly), lw)) = &e.label {
-                let c = ts(*lx, *ly);
-                let r = Rect::from_center_size(c, Vec2::new(*lw as f32, 20.0) * zoom);
-                painter.rect(
-                    r,
-                    4.0 * zoom,
-                    Color32::WHITE,
-                    Stroke::new(1.0 * zoom, LABEL_BORDER),
-                );
-                painter.text(
-                    c,
-                    Align2::CENTER_CENTER,
-                    t,
-                    zfont(13.0, zoom),
-                    TEXT,
-                );
-            }
-        }
-        if is_class {
-            for (i, (n, b)) in self.scn.nodes.iter().zip(&self.boxes).enumerate() {
-                let accent = accent_color(i);
-                draw_class_box(painter, n, b, ts(n.x, n.y), zoom, accent, hovered_node == Some(i));
-            }
-        } else if is_er {
-            for (i, (n, t)) in self.scn.nodes.iter().zip(&self.tables).enumerate() {
-                let accent = accent_color(i);
-                draw_table(
-                    painter,
-                    n,
-                    t,
-                    ts(n.x, n.y),
-                    zoom,
-                    accent,
-                    hovered_node == Some(i),
-                );
-            }
-        } else {
-            for (i, n) in self.scn.nodes.iter().enumerate() {
-                draw_node(painter, n, ts(n.x, n.y), zoom, hovered_node == Some(i));
-            }
-        }
-
-        // Static diagrams draw from their own geometry (scn is empty).
-        if let Some(ps) = &self.pie {
-            draw_pie(painter, ps, &self.pie_labels, self.pie_empty, &ts, zoom);
-        } else if let Some(sq) = &self.seq {
-            draw_sequence(painter, sq, &self.seq_labels, &ts, zoom);
-        }
+        let refs = DiagramRefs {
+            scn: &self.scn,
+            tables: &self.tables,
+            cards: &self.cards,
+            boxes: &self.boxes,
+            rels: &self.rels,
+            pie: self.pie.as_ref(),
+            pie_labels: &self.pie_labels,
+            pie_empty: self.pie_empty,
+            seq: self.seq.as_ref(),
+            seq_labels: &self.seq_labels,
+        };
+        paint_diagram(painter, &refs, hovered_node, &ts, zoom, true);
     }
 
     /// Judul jendela dihitung di AKHIR frame — setelah semua mutasi
@@ -1699,6 +1611,557 @@ impl App {
         if title != self.last_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.last_title = title;
+        }
+    }
+}
+
+// ── Markdown: dokumen ter-render dengan diagram inline ────────────
+
+/// Referensi data gambar SATU diagram — dipinjam dari field App
+/// (kanvas utama) atau dari blok Markdown (pratinjau inline), supaya
+/// keduanya memakai satu fungsi lukis yang sama: [`paint_diagram`].
+struct DiagramRefs<'a> {
+    scn: &'a Scene,
+    tables: &'a [ErTable],
+    cards: &'a [(Card, Card)],
+    boxes: &'a [ClassBox],
+    rels: &'a [RelStyle],
+    pie: Option<&'a PieScene>,
+    pie_labels: &'a [Option<String>],
+    pie_empty: bool,
+    seq: Option<&'a SeqScene>,
+    seq_labels: &'a [String],
+}
+
+/// Lukis satu diagram lengkap (kertas, cluster, edge, node/tabel/
+/// box, pie, sequence) lewat transform `ts` — dipakai kanvas utama
+/// dan pratinjau inline dokumen Markdown.
+fn paint_diagram(
+    painter: &egui::Painter,
+    d: &DiagramRefs,
+    hovered: Option<usize>,
+    ts: &impl Fn(f64, f64) -> Pos2,
+    zoom: f32,
+    paper: bool,
+) {
+    // "Kertas" putih — cermin latar putih ekspor SVG; batasnya bbox
+    // konten aktual supaya node yang digeser negatif tetap tertutup.
+    if paper && d.scn.width > 0.0 && d.scn.height > 0.0 {
+        let (mut x0, mut y0, mut x1, mut y1) = (0.0f64, 0.0f64, d.scn.width, d.scn.height);
+        for n in &d.scn.nodes {
+            x0 = x0.min(n.x - n.w / 2.0);
+            y0 = y0.min(n.y - n.h / 2.0);
+            x1 = x1.max(n.x + n.w / 2.0);
+            y1 = y1.max(n.y + n.h / 2.0);
+        }
+        for c in &d.scn.clusters {
+            x0 = x0.min(c.x);
+            y0 = y0.min(c.y);
+        }
+        let paper = Rect::from_min_max(ts(x0, y0), ts(x1, y1)).expand(16.0 * zoom);
+        painter.rect_filled(
+            paper.translate(Vec2::new(0.0, 2.5)).expand(1.5),
+            9.0 * zoom,
+            Color32::from_black_alpha(70),
+        );
+        painter.rect(paper, 8.0 * zoom, Color32::WHITE, Stroke::new(1.0, LABEL_BORDER));
+    }
+
+    for c in &d.scn.clusters {
+        let tl = ts(c.x, c.y);
+        let rect = Rect::from_min_size(tl, Vec2::new(c.w as f32, c.h as f32) * zoom);
+        painter.rect(
+            rect,
+            8.0 * zoom,
+            Color32::from_rgb(0xf7, 0xf8, 0xfd),
+            Stroke::new(1.4 * zoom, Color32::from_rgb(0xc9, 0xcf, 0xe8)),
+        );
+        painter.text(
+            tl + Vec2::new(10.0, 11.0) * zoom,
+            Align2::LEFT_CENTER,
+            &c.title,
+            // Jaga agar judul tetap terbaca saat zoom kecil
+            // (12 × 0.5 = lantai 6 pt, tetap terkuantisasi).
+            zfont(12.0, zoom.max(0.5)),
+            TYPE_MUTED,
+        );
+    }
+    let is_er = !d.tables.is_empty();
+    let is_class = !d.boxes.is_empty();
+    for (i, e) in d.scn.edges.iter().enumerate() {
+        if matches!(e.kind, EdgeKind::Invisible) {
+            continue; // link penata layout — tidak digambar
+        }
+        let p = e.bezier.map(|(x, y)| ts(x, y));
+        let sw = (if matches!(e.kind, EdgeKind::Thick | EdgeKind::ThickOpen) {
+            3.4
+        } else {
+            1.7
+        }) * zoom;
+        let stroke = Stroke::new(sw, EDGE);
+        if matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen) {
+            dashed_bezier(painter, p, stroke);
+        } else {
+            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                p,
+                false,
+                Color32::TRANSPARENT,
+                stroke,
+            ));
+        }
+        if is_class {
+            // Glyph UML di ujung `to`; kardinalitas di kedua sisi.
+            // `.get` menjaga andai edge & rels tak sejajar.
+            if let Some(rel) = d.rels.get(i) {
+                draw_head(painter, &class::head(e.bezier[3], e.bezier[2], rel.kind), ts, zoom);
+                if let Some(c) = &rel.from_card {
+                    draw_card(painter, e.bezier[0], e.bezier[1], c, ts, zoom);
+                }
+                if let Some(c) = &rel.to_card {
+                    draw_card(painter, e.bezier[3], e.bezier[2], c, ts, zoom);
+                }
+            }
+        } else if let Some(&(cf, ct)) = d.cards.get(i).filter(|_| is_er) {
+            // Notasi crow's foot di kedua ujung relasi ER.
+            draw_glyph(painter, &er::glyph(e.bezier[0], e.bezier[1], cf), ts, zoom);
+            draw_glyph(painter, &er::glyph(e.bezier[3], e.bezier[2], ct), ts, zoom);
+        } else if e.kind.has_arrow() {
+            arrow_head(painter, p, EDGE, zoom);
+        }
+        if let Some((t, (lx, ly), lw)) = &e.label {
+            let c = ts(*lx, *ly);
+            let r = Rect::from_center_size(c, Vec2::new(*lw as f32, 20.0) * zoom);
+            painter.rect(r, 4.0 * zoom, Color32::WHITE, Stroke::new(1.0 * zoom, LABEL_BORDER));
+            painter.text(c, Align2::CENTER_CENTER, t, zfont(13.0, zoom), TEXT);
+        }
+    }
+    if is_class {
+        for (i, (n, b)) in d.scn.nodes.iter().zip(d.boxes).enumerate() {
+            draw_class_box(painter, n, b, ts(n.x, n.y), zoom, accent_color(i), hovered == Some(i));
+        }
+    } else if is_er {
+        for (i, (n, t)) in d.scn.nodes.iter().zip(d.tables).enumerate() {
+            draw_table(painter, n, t, ts(n.x, n.y), zoom, accent_color(i), hovered == Some(i));
+        }
+    } else {
+        for (i, n) in d.scn.nodes.iter().enumerate() {
+            draw_node(painter, n, ts(n.x, n.y), zoom, hovered == Some(i));
+        }
+    }
+    if let Some(ps) = d.pie {
+        draw_pie(painter, ps, d.pie_labels, d.pie_empty, ts, zoom);
+    } else if let Some(sq) = d.seq {
+        draw_sequence(painter, sq, d.seq_labels, ts, zoom);
+    }
+}
+
+/// Satu blok ```mermaid di dokumen Markdown yang sudah di-layout,
+/// siap dilukis inline — atau pesan parse error-nya.
+enum BlockView {
+    Ok(Box<DiagramData>),
+    Err(String),
+}
+
+/// Geometri + data gambar milik satu blok (bentuk owned dari
+/// [`DiagramRefs`]).
+struct DiagramData {
+    scn: Scene,
+    tables: Vec<ErTable>,
+    cards: Vec<(Card, Card)>,
+    boxes: Vec<ClassBox>,
+    rels: Vec<RelStyle>,
+    pie: Option<PieScene>,
+    pie_labels: Vec<Option<String>>,
+    pie_empty: bool,
+    seq: Option<SeqScene>,
+    seq_labels: Vec<String>,
+    width: f64,
+    height: f64,
+}
+
+impl DiagramData {
+    fn refs(&self) -> DiagramRefs<'_> {
+        DiagramRefs {
+            scn: &self.scn,
+            tables: &self.tables,
+            cards: &self.cards,
+            boxes: &self.boxes,
+            rels: &self.rels,
+            pie: self.pie.as_ref(),
+            pie_labels: &self.pie_labels,
+            pie_empty: self.pie_empty,
+            seq: self.seq.as_ref(),
+            seq_labels: &self.seq_labels,
+        }
+    }
+}
+
+/// Layout otomatis satu blok mermaid (semua tipe diagram engine).
+fn build_block(src: &str) -> BlockView {
+    let mut d = DiagramData {
+        scn: blank_scene(0.0, 0.0),
+        tables: Vec::new(),
+        cards: Vec::new(),
+        boxes: Vec::new(),
+        rels: Vec::new(),
+        pie: None,
+        pie_labels: Vec::new(),
+        pie_empty: false,
+        seq: None,
+        seq_labels: Vec::new(),
+        width: 0.0,
+        height: 0.0,
+    };
+    match flowmaid::parser::parse_document(src) {
+        Err(e) => return BlockView::Err(e.to_string()),
+        Ok(Document::Flowchart(g)) | Ok(Document::State(g)) => d.scn = scene(&g),
+        Ok(Document::Er(er_d)) => {
+            let es = er::scene(&er_d);
+            d.scn = es.scene;
+            d.tables = es.tables;
+            d.cards = es.cards;
+        }
+        Ok(Document::Class(c)) => {
+            let cs = class::scene(&c);
+            d.scn = cs.scene;
+            d.boxes = cs.boxes;
+            d.rels = cs.rels;
+        }
+        Ok(Document::Pie(p)) => {
+            let ps = pie::scene(&p);
+            d.pie_labels = ps
+                .slices
+                .iter()
+                .map(|sl| {
+                    (sl.frac >= pie::MIN_LABEL_FRAC).then(|| format!("{:.0}%", sl.frac * 100.0))
+                })
+                .collect();
+            d.pie_empty = ps.slices.iter().map(|s| s.frac).sum::<f64>() <= f64::EPSILON;
+            d.scn = blank_scene(ps.width, ps.height);
+            d.pie = Some(ps);
+        }
+        Ok(Document::Sequence(s)) => {
+            let sc = seq::scene(&s);
+            d.seq_labels = sc
+                .messages
+                .iter()
+                .map(|m| match m.number {
+                    Some(k) => format!("{k}. {}", m.text),
+                    None => m.text.clone(),
+                })
+                .collect();
+            d.scn = blank_scene(sc.width, sc.height);
+            d.seq = Some(sc);
+        }
+    }
+    d.width = d.scn.width;
+    d.height = d.scn.height;
+    BlockView::Ok(Box::new(d))
+}
+
+/// Satu potongan teks inline dengan gayanya.
+struct Run {
+    text: String,
+    strong: bool,
+    em: bool,
+    code: bool,
+    link: bool,
+}
+
+/// Satu elemen blok dokumen Markdown ter-render.
+enum MdItem {
+    Heading(u8, Vec<Run>),
+    Para(Vec<Run>),
+    /// (kedalaman indent, nomor urut bila ordered, isi)
+    Bullet(u8, Option<u64>, Vec<Run>),
+    Quote(Vec<Run>),
+    CodeBlock(String),
+    /// Indeks ke [`MdDoc::blocks`].
+    Diagram(usize),
+    Rule,
+}
+
+/// Dokumen Markdown ter-render: daftar elemen + diagram ter-layout.
+struct MdDoc {
+    items: Vec<MdItem>,
+    blocks: Vec<BlockView>,
+    /// Sumber tiap blok, untuk tombol "edit sebagai tab".
+    block_srcs: Vec<String>,
+}
+
+/// Bangun [`MdDoc`] dari teks Markdown lewat AST crate `markdown`.
+fn build_mdoc(md: &str) -> MdDoc {
+    use markdown::mdast::Node;
+
+    fn runs(nodes: &[Node], out: &mut Vec<Run>, strong: bool, em: bool, code: bool, link: bool) {
+        for n in nodes {
+            match n {
+                Node::Text(t) => out.push(Run {
+                    text: t.value.clone(),
+                    strong,
+                    em,
+                    code,
+                    link,
+                }),
+                Node::InlineCode(c) => out.push(Run {
+                    text: c.value.clone(),
+                    strong,
+                    em,
+                    code: true,
+                    link,
+                }),
+                Node::Strong(s) => runs(&s.children, out, true, em, code, link),
+                Node::Emphasis(e) => runs(&e.children, out, strong, true, code, link),
+                Node::Link(l) => runs(&l.children, out, strong, em, code, true),
+                Node::Delete(d) => runs(&d.children, out, strong, em, code, link),
+                Node::Break(_) => out.push(Run {
+                    text: "\n".into(),
+                    strong,
+                    em,
+                    code,
+                    link,
+                }),
+                Node::Image(i) => out.push(Run {
+                    text: format!("[gambar: {}]", i.alt),
+                    strong,
+                    em: true,
+                    code,
+                    link,
+                }),
+                other => {
+                    if let Some(ch) = other.children() {
+                        runs(ch, out, strong, em, code, link);
+                    }
+                }
+            }
+        }
+    }
+    fn inline(nodes: &[Node]) -> Vec<Run> {
+        let mut v = Vec::new();
+        runs(nodes, &mut v, false, false, false, false);
+        v
+    }
+    fn walk(nodes: &[Node], doc: &mut MdDoc, depth: u8) {
+        for n in nodes {
+            match n {
+                Node::Heading(h) => doc.items.push(MdItem::Heading(h.depth, inline(&h.children))),
+                Node::Paragraph(p) => {
+                    let r = inline(&p.children);
+                    if depth == 0 {
+                        doc.items.push(MdItem::Para(r));
+                    } else {
+                        // Paragraf di dalam list item digambar oleh
+                        // cabang List di bawah; tak sampai ke sini.
+                        doc.items.push(MdItem::Para(r));
+                    }
+                }
+                Node::Code(c) => {
+                    let lang = c.lang.as_deref().unwrap_or("");
+                    if lang.eq_ignore_ascii_case("mermaid") || lang.eq_ignore_ascii_case("mmd") {
+                        doc.items.push(MdItem::Diagram(doc.blocks.len()));
+                        doc.blocks.push(build_block(&c.value));
+                        doc.block_srcs.push(c.value.clone());
+                    } else {
+                        doc.items.push(MdItem::CodeBlock(c.value.clone()));
+                    }
+                }
+                Node::List(l) => {
+                    let mut num = l.start.map(u64::from);
+                    for item in &l.children {
+                        if let Node::ListItem(li) = item {
+                            // Baris pertama item = paragraf pertamanya.
+                            let mut lead: Vec<Run> = Vec::new();
+                            for ch in &li.children {
+                                match ch {
+                                    Node::Paragraph(p) if lead.is_empty() => {
+                                        lead = inline(&p.children)
+                                    }
+                                    Node::List(_) => {}
+                                    _ => {}
+                                }
+                            }
+                            doc.items.push(MdItem::Bullet(depth, num, lead));
+                            if let Some(k) = num.as_mut() {
+                                *k += 1;
+                            }
+                            // List bersarang di dalam item.
+                            for ch in &li.children {
+                                if matches!(ch, Node::List(_)) {
+                                    walk(std::slice::from_ref(ch), doc, depth + 1);
+                                }
+                            }
+                        }
+                    }
+                }
+                Node::Blockquote(b) => {
+                    for ch in &b.children {
+                        if let Node::Paragraph(p) = ch {
+                            doc.items.push(MdItem::Quote(inline(&p.children)));
+                        }
+                    }
+                }
+                Node::ThematicBreak(_) => doc.items.push(MdItem::Rule),
+                other => {
+                    if let Some(ch) = other.children() {
+                        walk(ch, doc, depth);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut doc = MdDoc {
+        items: Vec::new(),
+        blocks: Vec::new(),
+        block_srcs: Vec::new(),
+    };
+    if let Ok(ast) = markdown::to_mdast(md, &markdown::ParseOptions::default()) {
+        if let Some(children) = ast.children() {
+            walk(children, &mut doc, 0);
+        }
+    }
+    doc
+}
+
+/// Susun potongan-potongan inline menjadi satu LayoutJob bergaya
+/// (tebal/miring/kode/tautan), memakai warna tema aktif.
+fn runs_job(ui: &egui::Ui, runs: &[Run], size: f32, all_strong: bool) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = ui.available_width();
+    for r in runs {
+        let mut fmt = TextFormat {
+            font_id: if r.code {
+                FontId::monospace(size * 0.92)
+            } else {
+                FontId::proportional(size)
+            },
+            color: if r.strong || all_strong {
+                ui.visuals().strong_text_color()
+            } else {
+                ui.visuals().text_color()
+            },
+            italics: r.em,
+            ..Default::default()
+        };
+        if r.code {
+            fmt.background = ui.visuals().code_bg_color;
+        }
+        if r.link {
+            fmt.color = ui.visuals().hyperlink_color;
+            fmt.underline = Stroke::new(1.0, ui.visuals().hyperlink_color);
+        }
+        job.append(&r.text, 0.0, fmt);
+    }
+    job
+}
+
+/// Gambar satu elemen dokumen Markdown. Klik "edit sebagai tab" pada
+/// diagram menulis indeks bloknya ke `open_req`.
+fn draw_md_item(ui: &mut egui::Ui, item: &MdItem, mdoc: &MdDoc, open_req: &mut Option<usize>) {
+    match item {
+        MdItem::Heading(depth, runs) => {
+            let size = [24.0, 20.0, 17.0, 15.0, 14.0, 13.5][(*depth as usize - 1).min(5)];
+            ui.add_space(if *depth <= 2 { 14.0 } else { 10.0 });
+            ui.label(runs_job(ui, runs, size, true));
+            if *depth <= 2 {
+                ui.separator();
+            }
+            ui.add_space(4.0);
+        }
+        MdItem::Para(runs) => {
+            ui.label(runs_job(ui, runs, 14.0, false));
+            ui.add_space(8.0);
+        }
+        MdItem::Bullet(depth, num, runs) => {
+            ui.horizontal_top(|ui| {
+                ui.add_space(10.0 + *depth as f32 * 18.0);
+                let marker = match num {
+                    Some(k) => format!("{k}."),
+                    None => "•".to_string(),
+                };
+                ui.label(egui::RichText::new(marker).size(14.0));
+                ui.label(runs_job(ui, runs, 14.0, false));
+            });
+            ui.add_space(3.0);
+        }
+        MdItem::Quote(runs) => {
+            egui::Frame::none()
+                .fill(ui.visuals().faint_bg_color)
+                .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                .rounding(4.0)
+                .show(ui, |ui| {
+                    ui.label(runs_job(ui, runs, 14.0, false));
+                });
+            ui.add_space(8.0);
+        }
+        MdItem::CodeBlock(text) => {
+            egui::Frame::none()
+                .fill(ui.visuals().code_bg_color)
+                .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                .rounding(6.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(text)
+                            .monospace()
+                            .size(12.5)
+                            .color(ui.visuals().text_color()),
+                    );
+                });
+            ui.add_space(8.0);
+        }
+        MdItem::Rule => {
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(6.0);
+        }
+        MdItem::Diagram(i) => {
+            match &mdoc.blocks[*i] {
+                BlockView::Ok(d) if d.width > 0.0 && d.height > 0.0 => {
+                    // Skala pas-lebar (tak pernah diperbesar >1).
+                    let avail = ui.available_width().min(820.0);
+                    let scale = ((avail - 24.0) / d.width as f32).min(1.0);
+                    let size = Vec2::new(
+                        d.width as f32 * scale + 24.0,
+                        d.height as f32 * scale + 24.0,
+                    );
+                    let (resp, painter) =
+                        ui.allocate_painter(size, egui::Sense::hover());
+                    painter.rect(
+                        resp.rect,
+                        8.0,
+                        Color32::WHITE,
+                        Stroke::new(1.0, LABEL_BORDER),
+                    );
+                    let origin = resp.rect.min + Vec2::splat(12.0);
+                    let ts = move |x: f64, y: f64| {
+                        origin + Vec2::new(x as f32, y as f32) * scale
+                    };
+                    paint_diagram(&painter, &d.refs(), None, &ts, scale, false);
+                }
+                BlockView::Ok(_) => {
+                    ui.weak("(diagram kosong)");
+                }
+                BlockView::Err(e) => {
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(0x3a, 0x22, 0x24))
+                        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                        .rounding(6.0)
+                        .show(ui, |ui| {
+                            ui.colored_label(
+                                Color32::from_rgb(0xe0, 0x5a, 0x5a),
+                                format!("blok mermaid #{}: {}", i + 1, e),
+                            );
+                        });
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.weak(format!("diagram #{}", i + 1));
+                if ui.small_button("edit sebagai tab").clicked() {
+                    *open_req = Some(*i);
+                }
+            });
+            ui.add_space(10.0);
         }
     }
 }
@@ -2603,18 +3066,30 @@ mod tests {
         assert!(out.contains("console.log(1)") && out.contains("penutup"));
         assert!(out.contains("A-->B"), "blok #1 tak tersentuh");
 
-        // Alur app: buka .md → 2 tab; edit; simpan → fence berubah.
+        // Alur app: buka .md → SATU tab dokumen ter-render.
         let dir = std::env::temp_dir().join(format!("flowmaid-md-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mdpath = dir.join("doc.md");
         std::fs::write(&mdpath, md).unwrap();
         let mut a = app();
         a.open_path(mdpath.clone());
-        assert_eq!(a.docs.len(), 2, "dua blok = dua tab");
-        assert!(a.tab_title(0).starts_with("doc.md #1"));
-        assert_eq!(a.active, 0, "fokus ke blok pertama");
+        assert_eq!(a.docs.len(), 1, "satu file md = satu tab dokumen");
+        assert!(a.path_is_markdown());
+        let m = a.mdoc.as_ref().expect("mode dokumen aktif");
+        assert_eq!(m.blocks.len(), 2, "dua diagram inline");
+        assert!(m.items.iter().any(|i| matches!(i, MdItem::Heading(1, _))));
+        assert!(m.items.iter().any(|i| matches!(i, MdItem::CodeBlock(_))), "fence js jadi code block");
+        assert!(matches!(m.blocks[0], BlockView::Ok(_)));
+        assert!(a.tab_title(0).starts_with("doc.md"));
+
+        // "edit sebagai tab": blok #1 jadi tab diagram tersendiri.
+        let src0 = m.block_srcs[0].clone();
+        a.open_md_block(&mdpath.clone(), 0, src0);
+        assert_eq!(a.docs.len(), 2);
+        assert!(a.tab_title(1).starts_with("doc.md #1"));
         assert!(matches!(a.model, Model::Flow(_)));
 
+        // Edit lalu simpan → menulis balik ke fence di file induk.
         a.src = "flowchart TD\nA-->C".into();
         assert!(a.save_doc(), "simpan blok md harus sukses");
         let on_disk = std::fs::read_to_string(&mdpath).unwrap();
@@ -2622,9 +3097,12 @@ mod tests {
         assert!(on_disk.contains("# Judul") && on_disk.contains("~~~mermaid"));
         assert!(!a.dirty());
 
-        // Buka ulang file yang sama tidak menduplikasi tab.
+        // Dedupe dua arah: blok yang sama & file md yang sama.
+        a.open_md_block(&mdpath.clone(), 0, String::new());
+        assert_eq!(a.docs.len(), 2, "blok sudah terbuka → pindah saja");
         a.open_path(mdpath);
-        assert_eq!(a.docs.len(), 2);
+        assert_eq!(a.docs.len(), 2, "dokumen sudah terbuka → pindah saja");
+        assert!(a.mdoc.is_some(), "kembali ke tab dokumen");
         std::fs::remove_dir_all(&dir).ok();
     }
 
