@@ -385,7 +385,9 @@ impl App {
                     .zip(prev_pos.iter().copied())
                     .collect();
                 match doc {
-                    Document::Flowchart(g) => {
+                    // State diagram menumpang Graph flowchart —
+                    // drag, posisi by-key, dan gambar sama persis.
+                    Document::Flowchart(g) | Document::State(g) => {
                         let mut auto = None;
                         self.pos = g
                             .nodes
@@ -1572,6 +1574,20 @@ fn draw_node(p: &egui::Painter, n: &SceneNode, c: Pos2, zoom: f32, hovered: bool
     let poly = |pts: Vec<Pos2>| egui::epaint::PathShape::convex_polygon(pts, fill, stroke);
     let (hw, hh) = (w / 2.0, h / 2.0);
     match n.shape {
+        // Pseudostate stateDiagram — cermin persis SVG-nya.
+        Shape::StateStart => {
+            p.circle_filled(c, hw, fill);
+            return; // tanpa label
+        }
+        Shape::StateEnd => {
+            p.circle(c, hw, Color32::WHITE, stroke);
+            p.circle_filled(c, (hw - 4.0 * zoom).max(2.0), fill);
+            return;
+        }
+        Shape::ForkBar => {
+            p.rect_filled(Rect::from_center_size(c, Vec2::new(w, h)), 3.0 * zoom, fill);
+            return;
+        }
         Shape::Circle => {
             p.circle(c, hw, fill, stroke);
         }
