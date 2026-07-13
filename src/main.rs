@@ -655,6 +655,48 @@ impl App {
         self.path.is_none() && !self.dirty() && self.src == CONTOH
     }
 
+    /// Satu tab di bar: judul + tombol tutup dalam SATU pil membulat,
+    /// tab aktif diberi warna seleksi. Klik-tengah juga menutup.
+    fn draw_tab(
+        &self,
+        ui: &mut egui::Ui,
+        i: usize,
+        switch: &mut Option<usize>,
+        close: &mut Option<usize>,
+    ) {
+        let active = i == self.active;
+        let (fill, text_color) = if active {
+            (ui.visuals().selection.bg_fill, ui.visuals().selection.stroke.color)
+        } else {
+            (ui.visuals().faint_bg_color, ui.visuals().weak_text_color())
+        };
+        egui::Frame::none()
+            .fill(fill)
+            .rounding(6.0)
+            .inner_margin(egui::Margin::symmetric(9.0, 4.0))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let title = ui.add(
+                    egui::Label::new(egui::RichText::new(self.tab_title(i)).color(text_color))
+                        .sense(egui::Sense::click())
+                        .selectable(false),
+                );
+                if title.clicked() && !active {
+                    *switch = Some(i);
+                }
+                if title.middle_clicked() {
+                    *close = Some(i);
+                }
+                let x = ui.add(
+                    egui::Button::new(egui::RichText::new("x").size(11.0).color(text_color))
+                        .frame(false),
+                );
+                if x.on_hover_text("tutup tab (Cmd+W)").clicked() {
+                    *close = Some(i);
+                }
+            });
+    }
+
     fn open_path(&mut self, p: PathBuf) {
         // Canonicalize agar cocok dengan path pohon explorer
         // (highlight file aktif) dan untuk dedupe antar-tab.
@@ -1080,37 +1122,42 @@ impl eframe::App for App {
             });
         });
 
-        // Bar tab dokumen — klik pindah, "x" menutup, "+" tab baru.
-        egui::TopBottomPanel::top("tabbar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                let mut switch: Option<usize> = None;
-                let mut close: Option<usize> = None;
-                for i in 0..self.docs.len() {
-                    let title = self.tab_title(i);
-                    let active = i == self.active;
-                    if ui.selectable_label(active, title).clicked() && !active {
-                        switch = Some(i);
-                    }
-                    if ui
-                        .small_button("x")
-                        .on_hover_text("tutup tab (Cmd+W)")
-                        .clicked()
-                    {
-                        close = Some(i);
-                    }
-                    ui.add_space(4.0);
-                }
-                if ui.small_button("+").on_hover_text("tab baru (Cmd+N)").clicked() {
-                    self.new_file();
-                }
-                if let Some(i) = switch {
-                    self.switch_to(i);
-                }
-                if let Some(i) = close {
-                    self.request_close(i);
-                }
+        // Bar tab dokumen — klik pindah, klik-tengah / "x" menutup,
+        // "+" tab baru. Satu baris ber-scroll, tidak melipat.
+        egui::TopBottomPanel::top("tabbar")
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(6.0, 3.0)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::horizontal()
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                    )
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let mut switch: Option<usize> = None;
+                            let mut close: Option<usize> = None;
+                            for i in 0..self.docs.len() {
+                                self.draw_tab(ui, i, &mut switch, &mut close);
+                            }
+                            ui.add_space(2.0);
+                            if ui
+                                .add(egui::Button::new("+").frame(false))
+                                .on_hover_text("tab baru (Cmd+N)")
+                                .clicked()
+                            {
+                                self.new_file();
+                            }
+                            if let Some(i) = switch {
+                                self.switch_to(i);
+                            }
+                            if let Some(i) = close {
+                                self.request_close(i);
+                            }
+                        });
+                    });
             });
-        });
 
         // Explorer folder ala VSCode — panel kiri, selalu tampil.
         egui::SidePanel::left("explorer")
@@ -1165,7 +1212,7 @@ impl eframe::App for App {
                 }
             });
 
-        // Toolbar: tab Preview | Code di kiri, aksi di kanan.
+        // Toolbar: mode tampilan di kiri, aksi, zoom rata-kanan.
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.view, View::Preview, "Preview");
@@ -1183,35 +1230,62 @@ impl eframe::App for App {
                     self.export_svg_file();
                 }
                 if self.view != View::Code {
-                    ui.separator();
-                    if ui.small_button("-").clicked() {
-                        self.zoom_around(1.0 / 1.25, self.canvas_size / 2.0);
-                    }
-                    if ui
-                        .small_button(format!("{:.0}%", self.zoom * 100.0))
-                        .on_hover_text("reset tampilan")
-                        .clicked()
-                    {
-                        self.reset_view();
-                    }
-                    if ui.small_button("+").clicked() {
-                        self.zoom_around(1.25, self.canvas_size / 2.0);
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if ui.small_button("+").clicked() {
+                            self.zoom_around(1.25, self.canvas_size / 2.0);
+                        }
+                        if ui
+                            .small_button(format!("{:.0}%", self.zoom * 100.0))
+                            .on_hover_text("reset tampilan")
+                            .clicked()
+                        {
+                            self.reset_view();
+                        }
+                        if ui.small_button("-").clicked() {
+                            self.zoom_around(1.0 / 1.25, self.canvas_size / 2.0);
+                        }
+                    });
                 }
-                // Status / error parse di ujung kanan.
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| match &self.error {
-                        Some(e) => {
-                            ui.colored_label(Color32::from_rgb(200, 60, 60), format!("parse: {e}"));
-                        }
-                        None => {
-                            ui.label(&self.status);
-                        }
-                    },
-                );
             });
         });
+
+        // Status bar bawah yang tipis: status/error di kiri, tipe
+        // diagram dokumen aktif di kanan.
+        egui::TopBottomPanel::bottom("statusbar")
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(8.0, 3.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    match &self.error {
+                        Some(e) => {
+                            ui.colored_label(
+                                Color32::from_rgb(224, 90, 90),
+                                format!("parse: {e}"),
+                            );
+                        }
+                        None => {
+                            ui.weak(&self.status);
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let kind = match &self.model {
+                            Model::Flow(g) => {
+                                format!("flowchart · {} node", g.nodes.len())
+                            }
+                            Model::Er(d) => format!("ER · {} entitas", d.entities.len()),
+                            Model::Class(d) => format!("class · {} kelas", d.classes.len()),
+                            Model::Sequence(d) => {
+                                format!("sequence · {} partisipan", d.participants.len())
+                            }
+                            Model::Pie(d) => format!("pie · {} slice", d.slices.len()),
+                        };
+                        ui.weak(kind);
+                    });
+                });
+            });
 
         // Area utama sesuai mode aktif.
         match self.view {
@@ -1323,6 +1397,12 @@ impl App {
                 y0 = y0.min(c.y);
             }
             let paper = Rect::from_min_max(ts(x0, y0), ts(x1, y1)).expand(16.0 * zoom);
+            // Bayangan tipis supaya kertas "terangkat" dari latar.
+            painter.rect_filled(
+                paper.translate(Vec2::new(0.0, 2.5)).expand(1.5),
+                9.0 * zoom,
+                Color32::from_black_alpha(70),
+            );
             painter.rect(
                 paper,
                 8.0 * zoom,
