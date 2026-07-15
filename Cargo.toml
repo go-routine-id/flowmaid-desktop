@@ -7,14 +7,19 @@ repository = "https://github.com/go-routine-id/flowmaid-desktop"
 publish = false # demo app — run from source
 
 [dependencies]
-flowmaid = "0.11"
+# LOKAL sementara: path ke engine agar dapat `mindmap::route()` (drag)
+# yang belum dirilis; sumber flowmaid sama dengan markmaid → tipe unifikasi.
+# Kembalikan ke `flowmaid = "0.13"` setelah 0.13.1 rilis.
+flowmaid = { path = "../diagram-engine-studio/flowrs" }
 # Fitur default dipertahankan: accesskit TIDAK dibuang — pohon
 # aksesibilitasnya lazy (baru dibangun saat screen reader terhubung),
 # jadi biaya runtime-nya ~nol sedangkan membuangnya mematikan
 # VoiceOver/NVDA (temuan verifikasi audit memory).
 eframe = { version = "0.29", features = ["persistence"] }
 rfd = "0.17.2"
-markdown = "1.0.0"
+# Mesin render Markdown (parse + layout → DocScene). Dipakai lokal via
+# path dep (BELUM dipublish beriringan) — tarik flowmaid yang sama.
+markmaid = { path = "../markmaid" }
 
 # Rampingkan binary release dan bantu inlining lintas-crate.
 [profile.release]

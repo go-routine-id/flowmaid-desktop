@@ -2,8 +2,9 @@
 //!
 //! - Multi-file : tab dokumen ala editor — klik file membuka tab baru,
 //!   Cmd+W menutup, tab dirty ditahan dialog, sesi tab dipulihkan
-//! - Markdown   : buka .md → tiap blok ```mermaid jadi tab; Simpan
-//!   menulis balik ke dalam fence-nya (crate `markdown`, via AST)
+//! - Markdown   : buka .md → dokumen ter-render via engine `markmaid`
+//!   (parse+layout → DocScene, dilukis native); tiap blok ```mermaid
+//!   bisa dibuka jadi tab, Simpan menulis balik ke dalam fence-nya
 //! - Panel kiri : explorer folder ala VSCode (klik file .mmd untuk buka)
 //! - Area utama : tab Preview | Split | Code
 //!     - Preview: kanvas penuh — node bisa DIGESER, edge realtime,
@@ -22,8 +23,11 @@
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use flowmaid::class::{self, ClassBox, RelStyle};
 use flowmaid::er::{self, ErTable};
+use flowmaid::journey::{self, JourneyScene};
+use flowmaid::mindmap::{self, MindScene};
 use flowmaid::model::{
-    Card, ClassDiagram, EdgeKind, ErDiagram, Graph, PieChart, SequenceDiagram, Shape,
+    Card, ClassDiagram, EdgeKind, ErDiagram, Graph, Journey, Mindmap, PieChart, SequenceDiagram,
+    Shape,
 };
 use flowmaid::pie::{self, PieScene};
 use flowmaid::scene::{route, scene, to_svg, Scene, SceneNode};
@@ -196,18 +200,21 @@ enum Model {
     Class(ClassDiagram),
     Pie(PieChart),
     Sequence(SequenceDiagram),
+    Mindmap(Mindmap),
+    Journey(Journey),
 }
 
 impl Model {
     /// Kunci identitas node/entitas/class ke-i, untuk mempertahankan
-    /// posisi geseran saat teks diedit. Pie/sequence tak punya node
-    /// yang bisa digeser, jadi kosong.
+    /// posisi geseran saat teks diedit. Pie/sequence tak punya node yang
+    /// bisa digeser (kosong); mindmap pakai teks node sebagai identitas.
     fn keys(&self) -> Vec<&str> {
         match self {
             Model::Flow(g) => g.nodes.iter().map(|n| n.id.as_str()).collect(),
             Model::Er(d) => d.entities.iter().map(|e| e.name.as_str()).collect(),
             Model::Class(d) => d.classes.iter().map(|c| c.name.as_str()).collect(),
-            Model::Pie(_) | Model::Sequence(_) => Vec::new(),
+            Model::Mindmap(m) => m.nodes.iter().map(|n| n.text.as_str()).collect(),
+            Model::Pie(_) | Model::Sequence(_) | Model::Journey(_) => Vec::new(),
         }
     }
 }
@@ -248,11 +255,13 @@ struct Doc {
     rels: Vec<RelStyle>,
     pie: Option<PieScene>,
     seq: Option<SeqScene>,
+    mind: Option<MindScene>,
+    journey: Option<JourneyScene>,
     pie_labels: Vec<Option<String>>,
     pie_empty: bool,
     seq_labels: Vec<String>,
     /// Some = tab ini DOKUMEN Markdown ter-render (bukan diagram).
-    mdoc: Option<MdDoc>,
+    mdoc: Option<MdView>,
     error: Option<String>,
     zoom: f32,
     pan: Vec2,
@@ -275,6 +284,8 @@ impl Doc {
             rels: Vec::new(),
             pie: None,
             seq: None,
+            mind: None,
+            journey: None,
             pie_labels: Vec::new(),
             pie_empty: false,
             seq_labels: Vec::new(),
@@ -318,11 +329,13 @@ struct App {
     rels: Vec<RelStyle>,      // gaya/kardinalitas relasi class, sejajar scn.edges
     pie: Option<PieScene>,    // geometri pie (Some hanya untuk Model::Pie)
     seq: Option<SeqScene>,    // geometri sequence (Some hanya untuk Model::Sequence)
+    mind: Option<MindScene>,  // geometri mindmap (Some hanya untuk Model::Mindmap)
+    journey: Option<JourneyScene>, // geometri journey (Some hanya untuk Model::Journey)
     // Precompute tampilan diagram statis (hindari format! per frame):
     pie_labels: Vec<Option<String>>, // "NN%" per slice; None = terlalu tipis
     pie_empty: bool,                 // total 0 → outline saja
     seq_labels: Vec<String>,         // label pesan final ("N. teks" / teks)
-    mdoc: Option<MdDoc>,             // Some = tab dokumen Markdown ter-render
+    mdoc: Option<MdView>,             // Some = tab dokumen Markdown ter-render
     error: Option<String>,
     status: String,
     zoom: f32,         // faktor zoom kanvas (1.0 = 100%)
@@ -369,6 +382,8 @@ impl App {
             rels: Vec::new(),
             pie: None,
             seq: None,
+            mind: None,
+            journey: None,
             pie_labels: Vec::new(),
             pie_empty: false,
             seq_labels: Vec::new(),
@@ -394,7 +409,7 @@ impl App {
         // Dokumen Markdown dirender sebagai DOKUMEN (heading, teks,
         // diagram inline) — bukan diparse sebagai diagram.
         if self.path_is_markdown() {
-            self.mdoc = Some(build_mdoc(&self.src));
+            self.mdoc = Some(build_mdview(&self.src));
             self.model = Model::Flow(Graph::default());
             self.pos = Vec::new();
             self.clear_aux();
@@ -469,6 +484,40 @@ impl App {
                     Document::Sequence(d) => {
                         self.model = Model::Sequence(d);
                     }
+                    Document::Journey(d) => {
+                        self.model = Model::Journey(d);
+                    }
+                    // Mindmap nodes ARE draggable: seed from the radial
+                    // auto-layout, keeping any node whose text (its key)
+                    // survived the edit at its dragged position. Only a
+                    // UNIQUELY-named node is preserved — duplicate labels
+                    // are indistinguishable by key, so they fall back to
+                    // auto-layout instead of all stacking on one saved
+                    // position.
+                    Document::Mindmap(d) => {
+                        let mut counts: HashMap<&str, usize> = HashMap::new();
+                        for n in &d.nodes {
+                            *counts.entry(n.text.as_str()).or_insert(0) += 1;
+                        }
+                        let mut auto = None;
+                        self.pos = d
+                            .nodes
+                            .iter()
+                            .enumerate()
+                            .map(|(i, n)| {
+                                let unique = counts[n.text.as_str()] == 1;
+                                unique
+                                    .then(|| old.get(n.text.as_str()).copied())
+                                    .flatten()
+                                    .unwrap_or_else(|| {
+                                        let a: &MindScene =
+                                            auto.get_or_insert_with(|| mindmap::scene(&d));
+                                        (a.nodes[i].cx(), a.nodes[i].cy())
+                                    })
+                            })
+                            .collect();
+                        self.model = Model::Mindmap(d);
+                    }
                 }
                 self.reroute();
                 self.error = None;
@@ -496,6 +545,13 @@ impl App {
             // Static: recompute the scene; nothing to route.
             Model::Pie(d) => self.set_static_pie(pie::scene(d)),
             Model::Sequence(d) => self.set_static_seq(seq::scene(d)),
+            Model::Journey(d) => self.set_static_journey(journey::scene(d)),
+            // Mindmap: re-route connectors from the (draggable) centres.
+            Model::Mindmap(d) => {
+                let ms = mindmap::route(d, &self.pos);
+                self.scn = blank_scene(ms.width, ms.height);
+                self.mind = Some(ms);
+            }
         }
     }
 
@@ -518,8 +574,19 @@ impl App {
             }
             Model::Pie(d) => self.set_static_pie(pie::scene(d)),
             Model::Sequence(d) => self.set_static_seq(seq::scene(d)),
+            Model::Journey(d) => self.set_static_journey(journey::scene(d)),
+            Model::Mindmap(d) => {
+                let ms = mindmap::scene(d);
+                self.pos = ms.nodes.iter().map(|n| (n.cx(), n.cy())).collect();
+                self.scn = blank_scene(ms.width, ms.height);
+                self.mind = Some(ms);
+            }
         }
-        self.pos = self.scn.nodes.iter().map(|n| (n.x, n.y)).collect();
+        // Scene-based types re-seed positions from the laid-out nodes;
+        // the mindmap arm already set its own (radial) centres above.
+        if !matches!(self.model, Model::Mindmap(_)) {
+            self.pos = self.scn.nodes.iter().map(|n| (n.x, n.y)).collect();
+        }
         self.reset_view();
     }
 
@@ -532,6 +599,8 @@ impl App {
         self.rels.clear();
         self.pie = None;
         self.seq = None;
+        self.mind = None;
+        self.journey = None;
         self.pie_labels.clear();
         self.seq_labels.clear();
     }
@@ -567,6 +636,12 @@ impl App {
         self.seq = Some(sc);
     }
 
+    /// Simpan geometri journey statis; `scn` memegang ukuran kanvas.
+    fn set_static_journey(&mut self, js: JourneyScene) {
+        self.scn = blank_scene(js.width, js.height);
+        self.journey = Some(js);
+    }
+
     /// SVG dari susunan saat ini (termasuk hasil geseran).
     fn export_svg(&self) -> String {
         match &self.model {
@@ -575,6 +650,9 @@ impl App {
             Model::Class(d) => class::to_svg(&class::route(d, &self.pos)),
             Model::Pie(d) => pie::to_svg(&pie::scene(d)),
             Model::Sequence(d) => seq::to_svg(&seq::scene(d)),
+            // Reflect any dragging via route() over the live positions.
+            Model::Mindmap(d) => mindmap::to_svg(&mindmap::route(d, &self.pos)),
+            Model::Journey(d) => journey::to_svg(&journey::scene(d)),
         }
     }
 
@@ -621,6 +699,8 @@ impl App {
         d.rels = std::mem::take(&mut self.rels);
         d.pie = self.pie.take();
         d.seq = self.seq.take();
+        d.mind = self.mind.take();
+        d.journey = self.journey.take();
         d.pie_labels = std::mem::take(&mut self.pie_labels);
         d.pie_empty = self.pie_empty;
         d.seq_labels = std::mem::take(&mut self.seq_labels);
@@ -648,6 +728,8 @@ impl App {
         self.rels = std::mem::take(&mut d.rels);
         self.pie = d.pie.take();
         self.seq = d.seq.take();
+        self.mind = d.mind.take();
+        self.journey = d.journey.take();
         self.pie_labels = std::mem::take(&mut d.pie_labels);
         self.pie_empty = d.pie_empty;
         self.seq_labels = std::mem::take(&mut d.seq_labels);
@@ -901,7 +983,7 @@ impl App {
                 return false;
             }
         };
-        let Some(next) = splice_md_block(&md, host.index, &self.src) else {
+        let Some(next) = markmaid::blocks::splice(&md, host.index, &self.src) else {
             self.status = format!(
                 "gagal menyimpan: blok mermaid #{} tidak ditemukan lagi di {} \
                  (file berubah, atau fence-nya ter-indentasi)",
@@ -1422,7 +1504,7 @@ impl eframe::App for App {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let kind = if let Some(m) = &self.mdoc {
-                            format!("markdown · {} diagram", m.blocks.len())
+                            format!("markdown · {} diagram", m.block_srcs.len())
                         } else {
                             match &self.model {
                                 Model::Flow(g) => {
@@ -1434,6 +1516,13 @@ impl eframe::App for App {
                                     format!("sequence · {} partisipan", d.participants.len())
                                 }
                                 Model::Pie(d) => format!("pie · {} slice", d.slices.len()),
+                                Model::Mindmap(d) => {
+                                    format!("mindmap · {} node", d.nodes.len())
+                                }
+                                Model::Journey(d) => {
+                                    let n: usize = d.sections.iter().map(|s| s.tasks.len()).sum();
+                                    format!("journey · {} task", n)
+                                }
                             }
                         };
                         ui.weak(kind);
@@ -1482,22 +1571,25 @@ impl App {
     /// Dokumen Markdown ter-render: heading/teks/list/kutipan/kode
     /// plus tiap blok ```mermaid dilukis inline sebagai diagram.
     fn draw_document(&mut self, ui: &mut egui::Ui) {
-        // Ambil-sementara supaya iterasi item tak bentrok dengan
-        // aksi tombol yang butuh &mut self.
-        let Some(mdoc) = self.mdoc.take() else { return };
+        // Ambil-sementara supaya interaksi diagram/tautan bisa
+        // meminjam &mut self (mdoc di-relayout di sini).
+        let Some(mut mdoc) = self.mdoc.take() else { return };
         let mut open_req: Option<usize> = None;
+        // Batasi lebar prosa supaya baris tidak terlalu panjang;
+        // markmaid sudah memberi margin dalam sendiri.
+        const MAX_W: f32 = 860.0;
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show(ui, |ui| {
-                egui::Frame::none()
-                    .inner_margin(egui::Margin::symmetric(20.0, 16.0))
-                    .show(ui, |ui| {
-                        ui.set_max_width(860.0);
-                        for item in &mdoc.items {
-                            draw_md_item(ui, item, &mdoc, &mut open_req);
-                        }
-                        ui.add_space(24.0);
-                    });
+                let width = ui.available_width().clamp(1.0, MAX_W);
+                // Layout hanya dihitung ulang saat lebar berubah —
+                // mengetik/scroll tidak membayar layout tiap frame.
+                if (width - mdoc.laid_width).abs() > 0.5 {
+                    mdoc.relayout(width);
+                }
+                let size = Vec2::new(mdoc.scene.width as f32, mdoc.scene.height as f32);
+                let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
+                paint_docscene(ui, &painter, &mdoc, resp.rect.min, &mut open_req);
             });
         self.mdoc = Some(mdoc);
         if let Some(i) = open_req {
@@ -1545,20 +1637,40 @@ impl App {
         //    rect dihitung inline, tanpa Vec perantara per frame.
         let mut moved = false;
         let mut hovered_node: Option<usize> = None;
-        for i in 0..self.scn.nodes.len() {
-            let n = &self.scn.nodes[i];
-            let rect =
-                Rect::from_center_size(ts(n.x, n.y), Vec2::new(n.w as f32, n.h as f32) * zoom);
-            let resp = ui.interact(rect, egui::Id::new(("flowrs-node", i)), Sense::drag());
-            if resp.hovered() || resp.dragged() {
-                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
-                hovered_node = Some(i);
+        if let Some(ms) = &self.mind {
+            // Mindmap: kotak node di-hit-test langsung (bukan Scene node);
+            // menggeser mengubah `pos`, lalu route() menyambung ulang.
+            for i in 0..ms.nodes.len() {
+                let b = &ms.nodes[i];
+                let rect = Rect::from_min_max(ts(b.x, b.y), ts(b.x + b.w, b.y + b.h));
+                let resp = ui.interact(rect, egui::Id::new(("mind-node", i)), Sense::drag());
+                if resp.hovered() || resp.dragged() {
+                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
+                    hovered_node = Some(i);
+                }
+                if resp.dragged() {
+                    let d = resp.drag_delta() / zoom;
+                    self.pos[i].0 += d.x as f64;
+                    self.pos[i].1 += d.y as f64;
+                    moved = true;
+                }
             }
-            if resp.dragged() {
-                let d = resp.drag_delta() / zoom; // delta layar -> dunia
-                self.pos[i].0 += d.x as f64;
-                self.pos[i].1 += d.y as f64;
-                moved = true;
+        } else {
+            for i in 0..self.scn.nodes.len() {
+                let n = &self.scn.nodes[i];
+                let rect =
+                    Rect::from_center_size(ts(n.x, n.y), Vec2::new(n.w as f32, n.h as f32) * zoom);
+                let resp = ui.interact(rect, egui::Id::new(("flowrs-node", i)), Sense::drag());
+                if resp.hovered() || resp.dragged() {
+                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
+                    hovered_node = Some(i);
+                }
+                if resp.dragged() {
+                    let d = resp.drag_delta() / zoom; // delta layar -> dunia
+                    self.pos[i].0 += d.x as f64;
+                    self.pos[i].1 += d.y as f64;
+                    moved = true;
+                }
             }
         }
         if moved {
@@ -1566,21 +1678,34 @@ impl App {
         }
 
         // 2) Lukis diagram lewat fungsi bersama (juga dipakai
-        //    pratinjau inline dokumen Markdown).
+        //    pratinjau inline dokumen Markdown). Mindmap punya painter
+        //    sendiri (bukan Scene node/edge) — di atas kertas putih
+        //    yang sama seperti pie/sequence.
         let painter = ui.painter();
-        let refs = DiagramRefs {
-            scn: &self.scn,
-            tables: &self.tables,
-            cards: &self.cards,
-            boxes: &self.boxes,
-            rels: &self.rels,
-            pie: self.pie.as_ref(),
-            pie_labels: &self.pie_labels,
-            pie_empty: self.pie_empty,
-            seq: self.seq.as_ref(),
-            seq_labels: &self.seq_labels,
-        };
-        paint_diagram(painter, &refs, hovered_node, &ts, zoom, true);
+        if let Some(ms) = &self.mind {
+            let paper = Rect::from_min_max(ts(0.0, 0.0), ts(ms.width, ms.height))
+                .expand(12.0 * zoom);
+            painter.rect(paper, 8.0 * zoom, Color32::WHITE, Stroke::new(1.0, LABEL_BORDER));
+            draw_mindmap(painter, ms, &ts, zoom);
+        } else if let Some(jsc) = &self.journey {
+            let paper = Rect::from_min_max(ts(0.0, 0.0), ts(jsc.width, jsc.height));
+            painter.rect(paper, 8.0 * zoom, Color32::WHITE, Stroke::new(1.0, LABEL_BORDER));
+            draw_journey(painter, jsc, &ts, zoom);
+        } else {
+            let refs = DiagramRefs {
+                scn: &self.scn,
+                tables: &self.tables,
+                cards: &self.cards,
+                boxes: &self.boxes,
+                rels: &self.rels,
+                pie: self.pie.as_ref(),
+                pie_labels: &self.pie_labels,
+                pie_empty: self.pie_empty,
+                seq: self.seq.as_ref(),
+                seq_labels: &self.seq_labels,
+            };
+            paint_diagram(painter, &refs, hovered_node, &ts, zoom, true);
+        }
     }
 
     /// Judul jendela dihitung di AKHIR frame — setelah semua mutasi
@@ -1755,94 +1880,137 @@ fn paint_diagram(
     }
 }
 
-/// Satu blok ```mermaid di dokumen Markdown yang sudah di-layout,
-/// siap dilukis inline — atau pesan parse error-nya.
-enum BlockView {
-    Ok(Box<DiagramData>),
-    Err(String),
+/// Dokumen Markdown ter-layout oleh **markmaid**: geometri absolut
+/// (`DocScene`) yang tinggal dilukis — teks, kotak, garis, gambar, dan
+/// tiap blok ```mermaid sebagai diagram flowmaid yang tertanam. Di-
+/// relayout hanya saat lebar panel berubah; sumber tiap blok mermaid
+/// disimpan agar bisa dibuka "sebagai tab" untuk disunting.
+struct MdView {
+    doc: markmaid::Doc,
+    scene: markmaid::DocScene,
+    /// Lebar konten (px) tempat `scene` terakhir dihitung; 0 = belum.
+    laid_width: f32,
+    /// Sumber tiap blok mermaid, urut dokumen — indeksnya sejajar
+    /// dengan urutan diagram di `scene` dan dengan `blocks::splice`.
+    block_srcs: Vec<String>,
 }
 
-/// Geometri + data gambar milik satu blok (bentuk owned dari
-/// [`DiagramRefs`]).
-struct DiagramData {
-    scn: Scene,
-    tables: Vec<ErTable>,
-    cards: Vec<(Card, Card)>,
-    boxes: Vec<ClassBox>,
-    rels: Vec<RelStyle>,
-    pie: Option<PieScene>,
-    pie_labels: Vec<Option<String>>,
-    pie_empty: bool,
-    seq: Option<SeqScene>,
-    seq_labels: Vec<String>,
-    width: f64,
-    height: f64,
-}
-
-impl DiagramData {
-    fn refs(&self) -> DiagramRefs<'_> {
-        DiagramRefs {
-            scn: &self.scn,
-            tables: &self.tables,
-            cards: &self.cards,
-            boxes: &self.boxes,
-            rels: &self.rels,
-            pie: self.pie.as_ref(),
-            pie_labels: &self.pie_labels,
-            pie_empty: self.pie_empty,
-            seq: self.seq.as_ref(),
-            seq_labels: &self.seq_labels,
-        }
+impl MdView {
+    /// Hitung ulang geometri untuk lebar konten `width` (px).
+    fn relayout(&mut self, width: f32) {
+        let opts = markmaid::LayoutOptions {
+            width: width as f64,
+            base_size: 14.0,
+        };
+        self.scene = markmaid::layout(&self.doc, &opts);
+        self.laid_width = width;
     }
 }
 
-/// Layout otomatis satu blok mermaid (semua tipe diagram engine).
-fn build_block(src: &str) -> BlockView {
-    let mut d = DiagramData {
-        scn: blank_scene(0.0, 0.0),
-        tables: Vec::new(),
-        cards: Vec::new(),
-        boxes: Vec::new(),
-        rels: Vec::new(),
+/// Parse Markdown lewat markmaid; geometri dihitung malas saat digambar
+/// (butuh lebar panel). Sumber blok mermaid diambil dari scanner teks
+/// mentah supaya indeksnya cocok dengan `blocks::splice` saat menyimpan.
+fn build_mdview(md: &str) -> MdView {
+    MdView {
+        doc: markmaid::parse(md),
+        scene: markmaid::DocScene::default(),
+        laid_width: 0.0,
+        block_srcs: markmaid::blocks::mermaid_blocks(md)
+            .into_iter()
+            .map(|(src, _)| src)
+            .collect(),
+    }
+}
+
+/// Peran warna markmaid → warna tema egui aktif. markmaid sengaja
+/// memakai PERAN, bukan nilai — konsumer memetakannya ke temanya
+/// sendiri, jadi dokumen ikut gelap/terang mengikuti app alih-alih
+/// memakai palet kertas-putih bawaan engine. `DiagramBg` tetap putih:
+/// diagram flowmaid memakai tinta gelap yang mengasumsikan kertas putih.
+fn role(v: &egui::Visuals, r: markmaid::ColorRole) -> Color32 {
+    use markmaid::ColorRole as R;
+    match r {
+        R::Text | R::CodeText => v.text_color(),
+        R::Strong => v.strong_text_color(),
+        R::Muted => v.weak_text_color(),
+        R::Link => v.hyperlink_color,
+        R::CodeBg => v.code_bg_color,
+        R::QuoteBg | R::TableStripeBg => v.faint_bg_color,
+        R::Border => v.widgets.noninteractive.bg_stroke.color,
+        R::ErrorText => v.error_fg_color,
+        // Merah semi-transparan → terbaca di tema terang maupun gelap.
+        R::ErrorBg => Color32::from_rgba_unmultiplied(0xc9, 0x2a, 0x2a, 40),
+        R::DiagramBg => Color32::WHITE,
+    }
+}
+
+/// `DiagramRefs` untuk diagram tanpa data samping (flowchart/state, dan
+/// dasar bagi pie/sequence yang scene-nya kosong). Lifetime elision
+/// mengikat hasilnya ke `scn` — tak bisa ditulis sebagai closure.
+fn base_refs(scn: &Scene) -> DiagramRefs<'_> {
+    DiagramRefs {
+        scn,
+        tables: &[],
+        cards: &[],
+        boxes: &[],
+        rels: &[],
         pie: None,
-        pie_labels: Vec::new(),
+        pie_labels: &[],
         pie_empty: false,
         seq: None,
-        seq_labels: Vec::new(),
-        width: 0.0,
-        height: 0.0,
-    };
-    match flowmaid::parser::parse_document(src) {
-        Err(e) => return BlockView::Err(e.to_string()),
-        Ok(Document::Flowchart(g)) | Ok(Document::State(g)) => d.scn = scene(&g),
-        Ok(Document::Er(er_d)) => {
-            let es = er::scene(&er_d);
-            d.scn = es.scene;
-            d.tables = es.tables;
-            d.cards = es.cards;
+        seq_labels: &[],
+    }
+}
+
+/// Lukis satu diagram tertanam dari sebuah `DiagramView` markmaid lewat
+/// [`paint_diagram`] bersama, dengan transform `ts`. Data turunan (label
+/// pie/sequence) dihitung on the fly — `DiagramView` menyimpan scene
+/// flowmaid apa adanya.
+fn paint_embedded(
+    painter: &egui::Painter,
+    view: &markmaid::DiagramView,
+    blank: &Scene,
+    ts: &impl Fn(f64, f64) -> Pos2,
+    zoom: f32,
+) {
+    use markmaid::DiagramView as V;
+    match view {
+        V::Flow(s) => paint_diagram(painter, &base_refs(s), None, ts, zoom, false),
+        V::Er(es) => {
+            let refs = DiagramRefs {
+                tables: &es.tables,
+                cards: &es.cards,
+                ..base_refs(&es.scene)
+            };
+            paint_diagram(painter, &refs, None, ts, zoom, false);
         }
-        Ok(Document::Class(c)) => {
-            let cs = class::scene(&c);
-            d.scn = cs.scene;
-            d.boxes = cs.boxes;
-            d.rels = cs.rels;
+        V::Class(cs) => {
+            let refs = DiagramRefs {
+                boxes: &cs.boxes,
+                rels: &cs.rels,
+                ..base_refs(&cs.scene)
+            };
+            paint_diagram(painter, &refs, None, ts, zoom, false);
         }
-        Ok(Document::Pie(p)) => {
-            let ps = pie::scene(&p);
-            d.pie_labels = ps
+        V::Pie(ps) => {
+            let pie_labels: Vec<Option<String>> = ps
                 .slices
                 .iter()
                 .map(|sl| {
                     (sl.frac >= pie::MIN_LABEL_FRAC).then(|| format!("{:.0}%", sl.frac * 100.0))
                 })
                 .collect();
-            d.pie_empty = ps.slices.iter().map(|s| s.frac).sum::<f64>() <= f64::EPSILON;
-            d.scn = blank_scene(ps.width, ps.height);
-            d.pie = Some(ps);
+            let pie_empty = ps.slices.iter().map(|s| s.frac).sum::<f64>() <= f64::EPSILON;
+            let refs = DiagramRefs {
+                pie: Some(ps),
+                pie_labels: &pie_labels,
+                pie_empty,
+                ..base_refs(blank)
+            };
+            paint_diagram(painter, &refs, None, ts, zoom, false);
         }
-        Ok(Document::Sequence(s)) => {
-            let sc = seq::scene(&s);
-            d.seq_labels = sc
+        V::Seq(ss) => {
+            let seq_labels: Vec<String> = ss
                 .messages
                 .iter()
                 .map(|m| match m.number {
@@ -1850,427 +2018,312 @@ fn build_block(src: &str) -> BlockView {
                     None => m.text.clone(),
                 })
                 .collect();
-            d.scn = blank_scene(sc.width, sc.height);
-            d.seq = Some(sc);
+            let refs = DiagramRefs {
+                seq: Some(ss),
+                seq_labels: &seq_labels,
+                ..base_refs(blank)
+            };
+            paint_diagram(painter, &refs, None, ts, zoom, false);
         }
+        // Mindmap & journey tak lewat DiagramRefs (bukan Scene node/
+        // edge) — punya painter sendiri.
+        V::Mind(ms) => draw_mindmap(painter, ms, ts, zoom),
+        V::Journey(jsc) => draw_journey(painter, jsc, ts, zoom),
     }
-    d.width = d.scn.width;
-    d.height = d.scn.height;
-    BlockView::Ok(Box::new(d))
 }
 
-/// Satu potongan teks inline dengan gayanya.
-struct Run {
-    text: String,
-    strong: bool,
-    em: bool,
-    code: bool,
-    strike: bool,
-    /// Some = tautan yang bisa diklik (URL tujuan).
-    url: Option<String>,
-}
-
-/// Satu elemen blok dokumen Markdown ter-render.
-enum MdItem {
-    Heading(u8, Vec<Run>),
-    Para(Vec<Run>),
-    /// (kedalaman indent, nomor urut bila ordered,
-    ///  centang task-list bila ada, isi)
-    Bullet(u8, Option<u64>, Option<bool>, Vec<Run>),
-    Quote(Vec<Run>),
-    CodeBlock(String),
-    /// Baris-baris tabel GFM; baris pertama = header.
-    Table(Vec<Vec<Vec<Run>>>),
-    /// Indeks ke [`MdDoc::blocks`].
-    Diagram(usize),
-    Rule,
-}
-
-/// Dokumen Markdown ter-render: daftar elemen + diagram ter-layout.
-struct MdDoc {
-    items: Vec<MdItem>,
-    blocks: Vec<BlockView>,
-    /// Sumber tiap blok, untuk tombol "edit sebagai tab".
-    block_srcs: Vec<String>,
-}
-
-/// Bangun [`MdDoc`] dari teks Markdown lewat AST crate `markdown`.
-fn build_mdoc(md: &str) -> MdDoc {
-    use markdown::mdast::Node;
-
-    #[derive(Clone, Default)]
-    struct Style {
-        strong: bool,
-        em: bool,
-        code: bool,
-        strike: bool,
-        url: Option<String>,
+/// Isi sebuah poligon star-shaped (cembung dari pusatnya — bang &
+/// cloud) lewat kipas segitiga dari `center`; `convex_polygon` egui
+/// salah mengisi bentuk cekung, jadi pakai mesh manual.
+fn fill_star(painter: &egui::Painter, center: Pos2, pts: &[Pos2], fill: Color32) {
+    let mut mesh = egui::epaint::Mesh::default();
+    mesh.colored_vertex(center, fill);
+    for &p in pts {
+        mesh.colored_vertex(p, fill);
     }
-    fn push(out: &mut Vec<Run>, text: String, st: &Style) {
-        out.push(Run {
-            text,
-            strong: st.strong,
-            em: st.em,
-            code: st.code,
-            strike: st.strike,
-            url: st.url.clone(),
-        });
+    let n = pts.len() as u32;
+    for k in 0..n {
+        mesh.add_triangle(0, 1 + k, 1 + (k + 1) % n);
     }
-    fn runs(nodes: &[Node], out: &mut Vec<Run>, st: &Style) {
-        for n in nodes {
-            match n {
-                Node::Text(t) => push(out, t.value.clone(), st),
-                Node::InlineCode(c) => {
-                    push(out, c.value.clone(), &Style { code: true, ..st.clone() })
-                }
-                Node::Strong(s) => runs(&s.children, out, &Style { strong: true, ..st.clone() }),
-                Node::Emphasis(e) => runs(&e.children, out, &Style { em: true, ..st.clone() }),
-                Node::Delete(d) => runs(&d.children, out, &Style { strike: true, ..st.clone() }),
-                Node::Link(l) => runs(
-                    &l.children,
-                    out,
-                    &Style { url: Some(l.url.clone()), ..st.clone() },
-                ),
-                Node::Break(_) => push(out, "\n".into(), st),
-                Node::Image(i) => {
-                    push(out, format!("[gambar: {}]", i.alt), &Style { em: true, ..st.clone() })
-                }
-                Node::FootnoteReference(f) => {
-                    push(out, format!("[^{}]", f.identifier), &Style { em: true, ..st.clone() })
-                }
-                other => {
-                    if let Some(ch) = other.children() {
-                        runs(ch, out, st);
-                    }
-                }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Lukis satu mindmap ala Mermaid: konektor Bézier meruncing di
+/// belakang, lalu node berwarna-isi (bentuk sesuai `MindShape`) dengan
+/// label ter-tengah. Geometri & warna dari engine dipakai apa adanya,
+/// jadi sama persis dengan ekspor SVG.
+fn draw_mindmap(
+    painter: &egui::Painter,
+    ms: &flowmaid::mindmap::MindScene,
+    ts: &impl Fn(f64, f64) -> Pos2,
+    zoom: f32,
+) {
+    use flowmaid::model::MindShape;
+
+    // Konektor (di belakang node), meruncing dari akar ke daun.
+    for e in &ms.edges {
+        let p = e.bezier.map(|(x, y)| ts(x, y));
+        painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+            p,
+            false,
+            Color32::TRANSPARENT,
+            Stroke::new(e.width as f32 * zoom, hex(e.color)),
+        ));
+    }
+
+    for n in &ms.nodes {
+        let fill = hex(n.fill);
+        // Bentuk poligon (hexagon/bang/cloud) memakai titik dari engine
+        // supaya identik dengan SVG; sisanya rect/elips.
+        if let Some(poly) = flowmaid::mindmap::perimeter(n) {
+            let pts: Vec<Pos2> = poly.iter().map(|&(x, y)| ts(x, y)).collect();
+            if n.shape == MindShape::Hexagon {
+                painter.add(egui::epaint::PathShape::convex_polygon(pts, fill, Stroke::NONE));
+            } else {
+                fill_star(painter, ts(n.cx(), n.cy()), &pts, fill);
             }
+        } else if n.shape == MindShape::Circle {
+            let pts: Vec<Pos2> = (0..32)
+                .map(|i| {
+                    let a = std::f64::consts::TAU * i as f64 / 32.0;
+                    ts(n.cx() + n.w / 2.0 * a.cos(), n.cy() + n.h / 2.0 * a.sin())
+                })
+                .collect();
+            painter.add(egui::epaint::PathShape::convex_polygon(pts, fill, Stroke::NONE));
+        } else {
+            let r = Rect::from_two_pos(ts(n.x, n.y), ts(n.x + n.w, n.y + n.h));
+            let round = match n.shape {
+                MindShape::Square => 3.0 * zoom,
+                _ => (r.height() / 2.0).min(14.0 * zoom),
+            };
+            painter.rect_filled(r, round, fill);
+        }
+        // Label ter-tengah, multi-baris via '\n'.
+        let color = hex(n.text_color);
+        let c = ts(n.cx(), n.cy());
+        let lines: Vec<&str> = n.text.split('\n').collect();
+        let line_h = flowmaid::mindmap::LINE_H as f32 * zoom;
+        for (i, line) in lines.iter().enumerate() {
+            let dy = (i as f32 - (lines.len() as f32 - 1.0) / 2.0) * line_h;
+            painter.text(
+                Pos2::new(c.x, c.y + dy),
+                Align2::CENTER_CENTER,
+                line,
+                zfont(14.0, zoom),
+                color,
+            );
         }
     }
-    fn inline(nodes: &[Node]) -> Vec<Run> {
-        let mut v = Vec::new();
-        runs(nodes, &mut v, &Style::default());
-        v
-    }
-    fn walk(nodes: &[Node], doc: &mut MdDoc, depth: u8) {
-        for n in nodes {
-            match n {
-                Node::Heading(h) => doc.items.push(MdItem::Heading(h.depth, inline(&h.children))),
-                Node::Paragraph(p) => doc.items.push(MdItem::Para(inline(&p.children))),
-                Node::Code(c) => {
-                    let lang = c.lang.as_deref().unwrap_or("");
-                    if lang.eq_ignore_ascii_case("mermaid") || lang.eq_ignore_ascii_case("mmd") {
-                        doc.items.push(MdItem::Diagram(doc.blocks.len()));
-                        doc.blocks.push(build_block(&c.value));
-                        doc.block_srcs.push(c.value.clone());
-                    } else {
-                        doc.items.push(MdItem::CodeBlock(c.value.clone()));
-                    }
-                }
-                Node::List(l) => {
-                    let mut num = l.start.map(u64::from);
-                    for item in &l.children {
-                        if let Node::ListItem(li) = item {
-                            // Baris pertama item = paragraf pertamanya;
-                            // centang GFM (- [x]) ikut dibawa.
-                            let mut lead: Option<Vec<Run>> = None;
-                            for ch in &li.children {
-                                if let Node::Paragraph(p) = ch {
-                                    if lead.is_none() {
-                                        lead = Some(inline(&p.children));
-                                    }
-                                }
-                            }
-                            doc.items.push(MdItem::Bullet(
-                                depth,
-                                num,
-                                li.checked,
-                                lead.unwrap_or_default(),
-                            ));
-                            if let Some(k) = num.as_mut() {
-                                *k += 1;
-                            }
-                            // Anak lain di dalam item: list bersarang
-                            // turun satu level indent; blok lain (code,
-                            // kutipan, paragraf ke-2+) ikut dirender —
-                            // dulu diam-diam hilang (lebar penuh, indent
-                            // belum dipertahankan).
-                            let mut first_para_seen = false;
-                            for ch in &li.children {
-                                match ch {
-                                    Node::Paragraph(_) if !first_para_seen => {
-                                        first_para_seen = true;
-                                    }
-                                    Node::List(_) => {
-                                        walk(std::slice::from_ref(ch), doc, depth + 1)
-                                    }
-                                    other => walk(std::slice::from_ref(other), doc, depth),
-                                }
-                            }
-                        }
-                    }
-                }
-                Node::Table(t) => {
-                    // Baris pertama = header (mdast GFM).
-                    let rows: Vec<Vec<Vec<Run>>> = t
-                        .children
-                        .iter()
-                        .filter_map(|row| match row {
-                            Node::TableRow(r) => Some(
-                                r.children
-                                    .iter()
-                                    .filter_map(|cell| match cell {
-                                        Node::TableCell(c) => Some(inline(&c.children)),
-                                        _ => None,
-                                    })
-                                    .collect(),
-                            ),
-                            _ => None,
-                        })
-                        .collect();
-                    if !rows.is_empty() {
-                        doc.items.push(MdItem::Table(rows));
-                    }
-                }
-                Node::Html(h) => doc.items.push(MdItem::CodeBlock(h.value.clone())),
-                Node::Blockquote(b) => {
-                    for ch in &b.children {
-                        if let Node::Paragraph(p) = ch {
-                            doc.items.push(MdItem::Quote(inline(&p.children)));
-                        }
-                    }
-                }
-                Node::ThematicBreak(_) => doc.items.push(MdItem::Rule),
-                other => {
-                    if let Some(ch) = other.children() {
-                        walk(ch, doc, depth);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut doc = MdDoc {
-        items: Vec::new(),
-        blocks: Vec::new(),
-        block_srcs: Vec::new(),
-    };
-    if let Ok(ast) = markdown::to_mdast(md, &md_parse_options()) {
-        if let Some(children) = ast.children() {
-            walk(children, &mut doc, 0);
-        }
-    }
-    doc
 }
 
-/// Susun potongan-potongan inline menjadi satu LayoutJob bergaya
-/// (tebal/miring/kode/coret/tautan), memakai warna tema aktif.
-fn runs_job(ui: &egui::Ui, runs: &[Run], size: f32, all_strong: bool) -> egui::text::LayoutJob {
+/// Lukis satu user-journey: pita seksi berwarna, garis penghubung,
+/// wajah ber-skor (senyum→cemberut), titik aktor, judul, dan legenda.
+/// Geometri & warna dari engine dipakai apa adanya (identik dgn SVG).
+fn draw_journey(
+    painter: &egui::Painter,
+    js: &JourneyScene,
+    ts: &impl Fn(f64, f64) -> Pos2,
+    zoom: f32,
+) {
+    // Pita seksi.
+    for b in &js.sections {
+        let r = Rect::from_min_max(ts(b.x, b.y), ts(b.x + b.w, b.y + b.h));
+        painter.rect_filled(r, 6.0 * zoom, hex(b.color));
+        if !b.name.is_empty() {
+            painter.text(
+                r.center(),
+                Align2::CENTER_CENTER,
+                &b.name,
+                zfont(13.0, zoom),
+                Color32::WHITE,
+            );
+        }
+    }
+    // Garis perjalanan (di belakang wajah).
+    if js.path.len() >= 2 {
+        let pts: Vec<Pos2> = js.path.iter().map(|&(x, y)| ts(x, y)).collect();
+        let stroke = Stroke::new(2.0 * zoom, hex(flowmaid::journey::PATH_COLOR));
+        painter.add(egui::Shape::line(pts, stroke));
+    }
+    // Wajah + titik aktor + label.
+    for t in &js.tasks {
+        for (dx, dy, color) in &t.actor_dots {
+            painter.circle_filled(ts(*dx, *dy), flowmaid::journey::DOT_R as f32 * zoom, hex(color));
+        }
+        let c = ts(t.cx, t.cy);
+        let r = t.r as f32 * zoom;
+        let stroke = Stroke::new(1.4 * zoom, hex(flowmaid::journey::FACE_STROKE));
+        painter.circle(c, r, hex(t.color), stroke);
+        let ink = hex(flowmaid::journey::FACE_INK);
+        for ex in [-0.32, 0.32] {
+            painter.circle_filled(
+                ts(t.cx + t.r * ex, t.cy - t.r * 0.18),
+                (t.r * 0.1) as f32 * zoom,
+                ink,
+            );
+        }
+        // Mulut: kurva kuadratik, arah lengkung ikut skor.
+        let my = t.cy + t.r * 0.24;
+        let curv = (t.score as f64 - 3.0) * t.r * 0.28;
+        painter.add(egui::epaint::QuadraticBezierShape::from_points_stroke(
+            [ts(t.cx - t.r * 0.42, my), ts(t.cx, my + curv), ts(t.cx + t.r * 0.42, my)],
+            false,
+            Color32::TRANSPARENT,
+            Stroke::new(1.6 * zoom, ink),
+        ));
+        painter.text(
+            ts(t.label_pos.0, t.label_pos.1),
+            Align2::CENTER_CENTER,
+            &t.name,
+            zfont(13.0, zoom),
+            TEXT,
+        );
+    }
+    // Judul.
+    if let Some(title) = &js.title {
+        painter.text(
+            ts(js.title_pos.0, js.title_pos.1),
+            Align2::CENTER_CENTER,
+            title,
+            zfont(17.0, zoom),
+            TEXT,
+        );
+    }
+    // Legenda aktor.
+    for it in &js.legend {
+        painter.circle_filled(ts(it.x + 6.0, it.y), 6.0 * zoom, hex(it.color));
+        painter.text(
+            ts(it.x + 16.0, it.y),
+            Align2::LEFT_CENTER,
+            &it.name,
+            zfont(13.0, zoom),
+            TEXT,
+        );
+    }
+}
+
+/// Lukis satu `DocScene` markmaid ke `painter`, berpangkal di `origin`
+/// (skala 1:1 — layout sudah dihitung pada lebar panel). Diagram bisa
+/// diklik untuk dibuka sebagai tab (lewat `open_req`); tautan yang
+/// diklik dibuka di browser.
+fn paint_docscene(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    view: &MdView,
+    origin: Pos2,
+    open_req: &mut Option<usize>,
+) {
     use egui::text::{LayoutJob, TextFormat};
-    let mut job = LayoutJob::default();
-    job.wrap.max_width = ui.available_width();
-    for r in runs {
-        let mut fmt = TextFormat {
-            font_id: if r.code {
-                FontId::monospace(size * 0.92)
-            } else {
-                FontId::proportional(size)
-            },
-            color: if r.strong || all_strong {
-                ui.visuals().strong_text_color()
-            } else {
-                ui.visuals().text_color()
-            },
-            italics: r.em,
-            ..Default::default()
-        };
-        if r.code {
-            fmt.background = ui.visuals().code_bg_color;
-        }
-        if r.strike {
-            fmt.strikethrough = Stroke::new(1.0, fmt.color);
-        }
-        if r.url.is_some() {
-            fmt.color = ui.visuals().hyperlink_color;
-            fmt.underline = Stroke::new(1.0, ui.visuals().hyperlink_color);
-        }
-        job.append(&r.text, 0.0, fmt);
-    }
-    job
-}
+    use markmaid::{ColorRole, Item};
 
-/// Gambar satu kumpulan run. Tanpa tautan → satu label (wrapping
-/// paling mulus); ada tautan → segmen-segmen inline dan tautannya
-/// jadi hyperlink sungguhan (klik membuka browser).
-fn draw_runs(ui: &mut egui::Ui, runs: &[Run], size: f32, all_strong: bool) {
-    if runs.iter().all(|r| r.url.is_none()) {
-        ui.label(runs_job(ui, runs, size, all_strong));
-        return;
-    }
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        let mut plain: Vec<Run> = Vec::new();
-        let flush = |ui: &mut egui::Ui, buf: &mut Vec<Run>| {
-            if !buf.is_empty() {
-                let job = runs_job(ui, buf, size, all_strong);
-                ui.label(job);
-                buf.clear();
-            }
-        };
-        for r in runs {
-            match &r.url {
-                Some(url) => {
-                    flush(ui, &mut plain);
-                    ui.hyperlink_to(r.text.clone(), url.clone());
-                }
-                None => plain.push(Run {
-                    text: r.text.clone(),
-                    strong: r.strong,
-                    em: r.em,
-                    code: r.code,
-                    strike: r.strike,
-                    url: None,
-                }),
-            }
-        }
-        flush(ui, &mut plain);
-    });
-}
+    let at = |x: f64, y: f64| origin + Vec2::new(x as f32, y as f32);
+    // Snapshot tema (owned) supaya pemetaan warna tak menahan pinjaman
+    // `ui` saat nanti memanggil `ui.interact`/`ui.output_mut`.
+    let vis = ui.visuals().clone();
+    // Scene kosong untuk pie/sequence: paint_diagram butuh `&Scene`,
+    // tapi node/edge-nya kosong — geometrinya ada di pie/seq sendiri.
+    let blank = blank_scene(0.0, 0.0);
+    let mut diagram_ord = 0usize;
 
-/// Gambar satu elemen dokumen Markdown. Klik "edit sebagai tab" pada
-/// diagram menulis indeks bloknya ke `open_req`.
-fn draw_md_item(ui: &mut egui::Ui, item: &MdItem, mdoc: &MdDoc, open_req: &mut Option<usize>) {
-    match item {
-        MdItem::Heading(depth, runs) => {
-            let size = [24.0, 20.0, 17.0, 15.0, 14.0, 13.5][(*depth as usize - 1).min(5)];
-            ui.add_space(if *depth <= 2 { 14.0 } else { 10.0 });
-            draw_runs(ui, runs, size, true);
-            if *depth <= 2 {
-                ui.separator();
+    for item in &view.scene.items {
+        match item {
+            Item::Rect(r) => {
+                let rect = Rect::from_min_size(at(r.x, r.y), Vec2::new(r.w as f32, r.h as f32));
+                let fill = r.fill.map_or(Color32::TRANSPARENT, |f| role(&vis, f));
+                let stroke = r.stroke.map_or(Stroke::NONE, |s| Stroke::new(1.0, role(&vis, s)));
+                painter.rect(rect, r.rounding as f32, fill, stroke);
             }
-            ui.add_space(4.0);
-        }
-        MdItem::Para(runs) => {
-            draw_runs(ui, runs, 14.0, false);
-            ui.add_space(8.0);
-        }
-        MdItem::Bullet(depth, num, checked, runs) => {
-            ui.horizontal_top(|ui| {
-                ui.add_space(10.0 + *depth as f32 * 18.0);
-                match (checked, num) {
-                    // Task list GFM: kotak centang (read-only).
-                    (Some(done), _) => {
-                        let mut v = *done;
-                        ui.add_enabled(false, egui::Checkbox::without_text(&mut v));
-                    }
-                    (None, Some(k)) => {
-                        ui.label(egui::RichText::new(format!("{k}.")).size(14.0));
-                    }
-                    (None, None) => {
-                        ui.label(egui::RichText::new("•").size(14.0));
-                    }
-                }
-                draw_runs(ui, runs, 14.0, false);
-            });
-            ui.add_space(3.0);
-        }
-        MdItem::Quote(runs) => {
-            egui::Frame::none()
-                .fill(ui.visuals().faint_bg_color)
-                .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-                .rounding(4.0)
-                .show(ui, |ui| {
-                    draw_runs(ui, runs, 14.0, false);
-                });
-            ui.add_space(8.0);
-        }
-        MdItem::Table(rows) => {
-            egui::Frame::none()
-                .stroke(Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
-                .inner_margin(egui::Margin::same(8.0))
-                .rounding(6.0)
-                .show(ui, |ui| {
-                    egui::Grid::new(rows.as_ptr())
-                        .striped(true)
-                        .spacing([18.0, 6.0])
-                        .show(ui, |ui| {
-                            for (ri, row) in rows.iter().enumerate() {
-                                for cell in row {
-                                    // Baris pertama = header (ditebalkan).
-                                    draw_runs(ui, cell, 13.5, ri == 0);
-                                }
-                                ui.end_row();
-                            }
-                        });
-                });
-            ui.add_space(8.0);
-        }
-        MdItem::CodeBlock(text) => {
-            egui::Frame::none()
-                .fill(ui.visuals().code_bg_color)
-                .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-                .rounding(6.0)
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(text)
-                            .monospace()
-                            .size(12.5)
-                            .color(ui.visuals().text_color()),
-                    );
-                });
-            ui.add_space(8.0);
-        }
-        MdItem::Rule => {
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(6.0);
-        }
-        MdItem::Diagram(i) => {
-            match &mdoc.blocks[*i] {
-                BlockView::Ok(d) if d.width > 0.0 && d.height > 0.0 => {
-                    // Skala pas-lebar (tak pernah diperbesar >1).
-                    let avail = ui.available_width().min(820.0);
-                    let scale = ((avail - 24.0) / d.width as f32).min(1.0);
-                    let size = Vec2::new(
-                        d.width as f32 * scale + 24.0,
-                        d.height as f32 * scale + 24.0,
-                    );
-                    let (resp, painter) =
-                        ui.allocate_painter(size, egui::Sense::hover());
-                    painter.rect(
-                        resp.rect,
-                        8.0,
-                        Color32::WHITE,
-                        Stroke::new(1.0, LABEL_BORDER),
-                    );
-                    let origin = resp.rect.min + Vec2::splat(12.0);
-                    let ts = move |x: f64, y: f64| {
-                        origin + Vec2::new(x as f32, y as f32) * scale
-                    };
-                    paint_diagram(&painter, &d.refs(), None, &ts, scale, false);
-                }
-                BlockView::Ok(_) => {
-                    ui.weak("(diagram kosong)");
-                }
-                BlockView::Err(e) => {
-                    egui::Frame::none()
-                        .fill(Color32::from_rgb(0x3a, 0x22, 0x24))
-                        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-                        .rounding(6.0)
-                        .show(ui, |ui| {
-                            ui.colored_label(
-                                Color32::from_rgb(0xe0, 0x5a, 0x5a),
-                                format!("blok mermaid #{}: {}", i + 1, e),
-                            );
-                        });
-                }
+            Item::Line(l) => {
+                painter.line_segment(
+                    [at(l.x1, l.y1), at(l.x2, l.y2)],
+                    Stroke::new(1.0, role(&vis, l.role)),
+                );
             }
-            ui.horizontal(|ui| {
-                ui.weak(format!("diagram #{}", i + 1));
-                if ui.small_button("edit sebagai tab").clicked() {
-                    *open_req = Some(*i);
+            Item::Text(t) => {
+                let color = role(&vis, t.role);
+                let font = if t.mono {
+                    FontId::monospace(t.size as f32)
+                } else {
+                    FontId::proportional(t.size as f32)
+                };
+                let deco = |on: bool| if on { Stroke::new(1.0, color) } else { Stroke::NONE };
+                let mut job = LayoutJob::default();
+                job.append(
+                    &t.text,
+                    0.0,
+                    TextFormat {
+                        font_id: font,
+                        color,
+                        italics: t.em,
+                        underline: deco(t.underline),
+                        strikethrough: deco(t.strike),
+                        ..Default::default()
+                    },
+                );
+                // markmaid y = puncak line box → jangkar kiri-atas.
+                painter.galley(at(t.x, t.y), painter.layout_job(job), color);
+            }
+            Item::Image(im) => {
+                // Engine tak mendekode piksel: gambar jadi kotak
+                // placeholder berbingkai dengan teks alt di tengah.
+                let rect = Rect::from_min_size(at(im.x, im.y), Vec2::new(im.w as f32, im.h as f32));
+                painter.rect(
+                    rect,
+                    4.0,
+                    role(&vis, ColorRole::CodeBg),
+                    Stroke::new(1.0, role(&vis, ColorRole::Border)),
+                );
+                let label = if im.alt.is_empty() {
+                    "▢ gambar".to_string()
+                } else {
+                    format!("▢ {}", im.alt)
+                };
+                painter.text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    label,
+                    FontId::proportional(12.0),
+                    role(&vis, ColorRole::Muted),
+                );
+            }
+            Item::Diagram(d) => {
+                let sc = d.scale;
+                let ts = |ex: f64, ey: f64| {
+                    origin + Vec2::new((d.x + ex * sc) as f32, (d.y + ey * sc) as f32)
+                };
+                paint_embedded(painter, &d.view, &blank, &ts, sc as f32);
+                // Diagram bisa diklik → buka blok sumbernya sebagai tab.
+                let drect = Rect::from_min_size(
+                    at(d.x, d.y),
+                    Vec2::new((d.size.0 * sc) as f32, (d.size.1 * sc) as f32),
+                );
+                let resp = ui
+                    .interact(
+                        drect,
+                        egui::Id::new(("mmd-diagram", diagram_ord)),
+                        Sense::click(),
+                    )
+                    .on_hover_text("klik untuk sunting blok ini sebagai tab");
+                if resp.hovered() {
+                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
                 }
-            });
-            ui.add_space(10.0);
+                if resp.clicked() && diagram_ord < view.block_srcs.len() {
+                    *open_req = Some(diagram_ord);
+                }
+                diagram_ord += 1;
+            }
+        }
+    }
+
+    // Tautan: zona hit-test dari markmaid → klik membuka URL di browser.
+    for (i, lz) in view.scene.links.iter().enumerate() {
+        let rect = Rect::from_min_size(at(lz.x, lz.y), Vec2::new(lz.w as f32, lz.h as f32));
+        let resp = ui.interact(rect, egui::Id::new(("mmd-link", i)), Sense::click());
+        if resp.hovered() {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(lz.url.clone()));
         }
     }
 }
@@ -2593,69 +2646,6 @@ fn draw_card(
         zfont(11.0, zoom),
         TEXT,
     );
-}
-
-/// Opsi parse Markdown BERSAMA untuk seluruh app (GFM: tabel, task
-/// list, strikethrough, autolink). Ekstraksi blok dan tampilan
-/// dokumen harus memakai opsi yang sama — kalau tidak, indeks blok
-/// di tampilan bisa bergeser dari indeks yang dipakai splice-save.
-fn md_parse_options() -> markdown::ParseOptions {
-    markdown::ParseOptions::gfm()
-}
-
-/// Blok ```mermaid di sebuah dokumen Markdown, diekstrak lewat AST
-/// crate `markdown` (bukan regex — fence bertilde, di dalam quote,
-/// dan info-string tetap terdeteksi benar). Tiap entri: isi blok +
-/// rentang byte SELURUH fence (pembuka s/d penutup) di sumber.
-fn mermaid_blocks(md: &str) -> Vec<(String, std::ops::Range<usize>)> {
-    fn walk(node: &markdown::mdast::Node, out: &mut Vec<(String, std::ops::Range<usize>)>) {
-        if let markdown::mdast::Node::Code(c) = node {
-            let lang = c.lang.as_deref().unwrap_or("");
-            if lang.eq_ignore_ascii_case("mermaid") || lang.eq_ignore_ascii_case("mmd") {
-                if let Some(p) = &c.position {
-                    out.push((c.value.clone(), p.start.offset..p.end.offset));
-                }
-            }
-        }
-        if let Some(children) = node.children() {
-            for ch in children {
-                walk(ch, out);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    if let Ok(ast) = markdown::to_mdast(md, &md_parse_options()) {
-        walk(&ast, &mut out);
-    }
-    out
-}
-
-/// Ganti ISI blok mermaid ke-`index` di teks Markdown dengan `src`,
-/// mempertahankan baris fence pembuka/penutup apa adanya (termasuk
-/// info-string). Gagal (None) bila blok tak ditemukan lagi atau
-/// fence-nya ter-indentasi (mis. di dalam list — belum didukung).
-fn splice_md_block(md: &str, index: usize, src: &str) -> Option<String> {
-    let (_, range) = mermaid_blocks(md).into_iter().nth(index)?;
-    let block = &md[range.clone()];
-    let open_len = block.find('\n')?;
-    let close_start = block.rfind('\n')?;
-    let (open, close) = (&block[..open_len], &block[close_start + 1..]);
-    // Kedua baris harus benar-benar fence TANPA indentasi: fence di
-    // dalam list menuntut re-indentasi isi (belum didukung), dan
-    // fence tak tertutup di EOF membuat baris terakhir = konten.
-    let fence = |s: &str| s.starts_with("```") || s.starts_with("~~~");
-    if !fence(open) || !fence(close) {
-        return None;
-    }
-    let mut out = String::with_capacity(md.len() + src.len());
-    out.push_str(&md[..range.start]);
-    out.push_str(open);
-    out.push('\n');
-    out.push_str(src.trim_end_matches('\n'));
-    out.push('\n');
-    out.push_str(close);
-    out.push_str(&md[range.end..]);
-    Some(out)
 }
 
 /// Scene kosong dengan ukuran kanvas — dipakai diagram statis
@@ -3171,17 +3161,43 @@ mod tests {
         let md = "# Judul\n\nteks pembuka\n\n```mermaid\nflowchart TD\nA-->B\n```\n\n\
                   paragraf tengah\n\n```js\nconsole.log(1)\n```\n\n\
                   ~~~mermaid\npie\n\"x\" : 1\n~~~\n\npenutup\n";
-        // Ekstraksi: dua blok mermaid, fence js dilewati.
-        let blocks = mermaid_blocks(md);
+        // Ekstraksi (scanner teks markmaid): dua blok mermaid, fence
+        // js dilewati.
+        let blocks = markmaid::blocks::mermaid_blocks(md);
         assert_eq!(blocks.len(), 2);
         assert!(blocks[0].0.starts_with("flowchart TD"));
         assert!(blocks[1].0.starts_with("pie"));
 
         // Splice mengganti isi blok #2 tanpa menyentuh sekitarnya.
-        let out = splice_md_block(md, 1, "pie\n\"y\" : 9").unwrap();
+        let out = markmaid::blocks::splice(md, 1, "pie\n\"y\" : 9").unwrap();
         assert!(out.contains("~~~mermaid\npie\n\"y\" : 9\n~~~"));
         assert!(out.contains("console.log(1)") && out.contains("penutup"));
         assert!(out.contains("A-->B"), "blok #1 tak tersentuh");
+
+        // Parse+layout markmaid: dua diagram tertanam, heading, dan
+        // fence non-mermaid jadi blok kode biasa.
+        let mut rendered = build_mdview(md);
+        rendered.relayout(600.0);
+        let diagrams = rendered
+            .scene
+            .items
+            .iter()
+            .filter(|i| matches!(i, markmaid::Item::Diagram(_)))
+            .count();
+        assert_eq!(diagrams, 2, "dua diagram inline ter-layout");
+        assert!(rendered
+            .doc
+            .blocks
+            .iter()
+            .any(|b| matches!(b, markmaid::Block::Heading { level: 1, .. })));
+        assert!(
+            rendered
+                .doc
+                .blocks
+                .iter()
+                .any(|b| matches!(b, markmaid::Block::Code { lang, .. } if lang == "js")),
+            "fence js jadi blok kode biasa"
+        );
 
         // Alur app: buka .md → SATU tab dokumen ter-render.
         let dir = std::env::temp_dir().join(format!("flowmaid-md-{}", std::process::id()));
@@ -3193,10 +3209,7 @@ mod tests {
         assert_eq!(a.docs.len(), 1, "satu file md = satu tab dokumen");
         assert!(a.path_is_markdown());
         let m = a.mdoc.as_ref().expect("mode dokumen aktif");
-        assert_eq!(m.blocks.len(), 2, "dua diagram inline");
-        assert!(m.items.iter().any(|i| matches!(i, MdItem::Heading(1, _))));
-        assert!(m.items.iter().any(|i| matches!(i, MdItem::CodeBlock(_))), "fence js jadi code block");
-        assert!(matches!(m.blocks[0], BlockView::Ok(_)));
+        assert_eq!(m.block_srcs.len(), 2, "dua sumber blok mermaid");
         assert!(a.tab_title(0).starts_with("doc.md"));
 
         // "edit sebagai tab": blok #1 jadi tab diagram tersendiri.
@@ -3227,39 +3240,33 @@ mod tests {
     fn gfm_tables_tasks_strike_and_links_render() {
         let md = "# T\n\n~~coret~~ dan [tautan](https://x.dev) di sini\n\n\
                   | Kolom A | Kolom B |\n|---|---|\n| a1 | b1 |\n| a2 | b2 |\n\n\
-                  - [x] beres\n- [ ] belum\n- biasa\n  ```mermaid\n  A-->B\n  ```\n";
-        let doc = build_mdoc(md);
-        // Strikethrough + URL sampai ke Run.
-        let para = doc.items.iter().find_map(|i| match i {
-            MdItem::Para(r) => Some(r),
-            _ => None,
-        });
-        let para = para.expect("paragraf ada");
-        assert!(para.iter().any(|r| r.strike && r.text.contains("coret")));
-        assert!(para
-            .iter()
-            .any(|r| r.url.as_deref() == Some("https://x.dev")));
-        // Tabel GFM: 3 baris (header + 2), 2 kolom.
-        let table = doc.items.iter().find_map(|i| match i {
-            MdItem::Table(rows) => Some(rows),
-            _ => None,
-        });
-        let table = table.expect("tabel ter-parse (GFM aktif)");
-        assert_eq!((table.len(), table[0].len()), (3, 2));
-        // Task list: centang terbawa; item biasa tanpa centang.
-        let checks: Vec<Option<bool>> = doc
-            .items
-            .iter()
-            .filter_map(|i| match i {
-                MdItem::Bullet(_, _, c, _) => Some(*c),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(checks, [Some(true), Some(false), None]);
-        // Code block mermaid DI DALAM list item tak lagi hilang —
-        // ia jadi diagram (fence ter-indentasi tetap ditolak splice,
-        // tapi rendering-nya jalan).
-        assert_eq!(doc.blocks.len(), 1, "diagram dalam list item ditemukan");
+                  - [x] beres\n- [ ] belum\n- biasa\n";
+        // Pipeline markmaid penuh: parse → layout → DocScene.
+        let mut v = build_mdview(md);
+        v.relayout(600.0);
+        let items = &v.scene.items;
+        // Tautan → zona klik dengan URL-nya (bisa dibuka browser).
+        assert!(
+            v.scene.links.iter().any(|l| l.url == "https://x.dev"),
+            "tautan jadi LinkZone"
+        );
+        // Strikethrough → TextRun.strike.
+        assert!(
+            items.iter().any(|it| matches!(it, markmaid::Item::Text(t)
+                if t.strike && t.text.contains("coret"))),
+            "strikethrough ter-render"
+        );
+        // Tabel GFM menggambar garis grid (LineItem).
+        assert!(
+            items.iter().any(|it| matches!(it, markmaid::Item::Line(_))),
+            "tabel menggambar garis grid"
+        );
+        // Header tabel ada sebagai teks.
+        assert!(
+            items.iter().any(|it| matches!(it, markmaid::Item::Text(t)
+                if t.text.contains("Kolom A"))),
+            "header tabel ter-render"
+        );
     }
 
     #[test]

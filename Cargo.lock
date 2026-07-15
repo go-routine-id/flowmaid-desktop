@@ -1121,9 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "flowmaid"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b6948067032160544c488448b8e605231b163810e8f70ca0e28de99d41cd545"
+version = "0.13.0"
 
 [[package]]
 name = "flowmaid-desktop"
@@ -1131,7 +1129,7 @@ version = "0.6.2"
 dependencies = [
  "eframe",
  "flowmaid",
- "markdown",
+ "markmaid",
  "rfd",
 ]
 
@@ -1813,12 +1811,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "markdown"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5cab8f2cadc416a82d2e783a1946388b31654d391d1c7d92cc1f03e295b1deb"
+name = "markmaid"
+version = "0.1.0"
 dependencies = [
- "unicode-id",
+ "flowmaid",
 ]
 
 [[package]]
@@ -3157,12 +3153,6 @@ dependencies = [
  "tempfile",
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "unicode-id"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70ba288e709927c043cbe476718d37be306be53fb1fafecd0dbe36d072be2580"
 
 [[package]]
 name = "unicode-ident"
