@@ -265,6 +265,11 @@ struct Doc {
     error: Option<String>,
     zoom: f32,
     pan: Vec2,
+    /// Pernah ada node yang digeser sejak buka/tata-ulang? Selama
+    /// false, reparse menampilkan geometri `scene()` engine utuh
+    /// (routing channel + slot label); `route()` baru dipakai untuk
+    /// mempertahankan posisi begitu user benar-benar menggeser.
+    dragged: bool,
 }
 
 impl Doc {
@@ -293,6 +298,7 @@ impl Doc {
             error: None,
             zoom: 1.0,
             pan: Vec2::ZERO,
+            dragged: false,
         }
     }
 }
@@ -341,6 +347,7 @@ struct App {
     zoom: f32,         // faktor zoom kanvas (1.0 = 100%)
     pan: Vec2,         // geseran kanvas, piksel layar
     canvas_size: Vec2, // ukuran kanvas frame terakhir (jangkar zoom via tombol)
+    dragged: bool,     // dokumen aktif: sudah ada node yang digeser (lihat Doc::dragged)
 }
 
 impl App {
@@ -393,6 +400,7 @@ impl App {
             zoom: 1.0,
             pan: Vec2::ZERO,
             canvas_size: Vec2::ZERO,
+            dragged: false,
         };
         app.reparse();
         app
@@ -424,11 +432,18 @@ impl App {
                 // bisa meminjam kuncinya (tanpa alokasi String).
                 let prev = std::mem::replace(&mut self.model, Model::Flow(Graph::default()));
                 let prev_pos = std::mem::take(&mut self.pos);
-                let old: HashMap<&str, (f64, f64)> = prev
-                    .keys()
-                    .into_iter()
-                    .zip(prev_pos.iter().copied())
-                    .collect();
+                // Posisi lama hanya dipertahankan bila user pernah
+                // menggeser node; tanpa drag, tiap reparse mengikuti
+                // auto-layout engine sepenuhnya (geometri scene() utuh,
+                // seperti mermaid live) alih-alih dirutekan ulang.
+                let old: HashMap<&str, (f64, f64)> = if self.dragged {
+                    prev.keys()
+                        .into_iter()
+                        .zip(prev_pos.iter().copied())
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
                 match doc {
                     // State diagram menumpang Graph flowchart —
                     // drag, posisi by-key, dan gambar sama persis.
@@ -519,7 +534,14 @@ impl App {
                         self.model = Model::Mindmap(d);
                     }
                 }
-                self.reroute();
+                if self.dragged {
+                    self.reroute();
+                } else {
+                    // Semua posisi dari auto-layout — pakai geometri
+                    // scene() langsung (edge lewat channel + label di
+                    // slotnya), tanpa mengubah zoom/pan user.
+                    self.apply_auto_scene();
+                }
                 self.error = None;
             }
             Err(e) => self.error = Some(e.to_string()),
@@ -555,8 +577,19 @@ impl App {
         }
     }
 
-    /// Kembali ke tata letak otomatis engine.
+    /// Kembali ke tata letak otomatis engine (tombol "Tata ulang"):
+    /// terapkan geometri auto, pulihkan pandangan, dan lupakan drag.
     fn autolayout(&mut self) {
+        self.apply_auto_scene();
+        self.dragged = false;
+        self.reset_view();
+    }
+
+    /// Terapkan geometri `scene()` engine apa adanya untuk model
+    /// aktif — routing channel, slot label, dan kotak cluster utuh —
+    /// lalu selaraskan `pos` ke pusat node hasil layout. Dipakai
+    /// tombol tata-ulang DAN reparse selama belum ada drag.
+    fn apply_auto_scene(&mut self) {
         self.clear_aux();
         match &self.model {
             Model::Flow(g) => self.scn = scene(g),
@@ -587,7 +620,6 @@ impl App {
         if !matches!(self.model, Model::Mindmap(_)) {
             self.pos = self.scn.nodes.iter().map(|n| (n.x, n.y)).collect();
         }
-        self.reset_view();
     }
 
     /// Kosongkan data gambar khusus-diagram (ER, class, pie, seq);
@@ -708,6 +740,7 @@ impl App {
         d.error = self.error.take();
         d.zoom = self.zoom;
         d.pan = self.pan;
+        d.dragged = self.dragged;
     }
 
     /// Muat dokumen ke-`i` dari parkiran menjadi dokumen aktif
@@ -737,6 +770,7 @@ impl App {
         self.error = d.error.take();
         self.zoom = d.zoom;
         self.pan = d.pan;
+        self.dragged = d.dragged;
     }
 
     fn switch_to(&mut self, i: usize) {
@@ -1674,6 +1708,7 @@ impl App {
             }
         }
         if moved {
+            self.dragged = true;
             self.reroute();
         }
 
@@ -3088,9 +3123,12 @@ mod tests {
         assert!(matches!(a.model, Model::Er(_)));
         assert_eq!(a.tables.len(), 2);
         assert_eq!(a.cards.len(), 1);
-        // Positions preserved by key across an edit.
+        // Positions preserved by key across an edit — geser satu
+        // entitas seperti handler drag (yang juga menyetel `dragged`;
+        // tanpa flag itu reparse mengikuti auto-layout sepenuhnya).
         let before = a.pos[0];
         a.pos[0] = (before.0 + 300.0, before.1);
+        a.dragged = true;
         a.src = "erDiagram\nusers ||--o{ posts : writes\nposts }o--|| tags : has".into();
         a.reparse();
         assert_eq!(

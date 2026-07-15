@@ -7,9 +7,9 @@ repository = "https://github.com/go-routine-id/flowmaid-desktop"
 publish = false # demo app — run from source
 
 [dependencies]
-# 0.14 = rilis dengan mindmap (radial + route/drag) & journey; versi yang
-# sama dipakai markmaid sehingga tipe flowmaid-nya terunifikasi.
-flowmaid = "0.15"
+# 0.17 = layout dagre-faithful + subgraph border-node clusters & label slots;
+# versi sama dipakai markmaid sehingga tipe flowmaid-nya terunifikasi.
+flowmaid = "0.17"
 # Fitur default dipertahankan: accesskit TIDAK dibuang — pohon
 # aksesibilitasnya lazy (baru dibangun saat screen reader terhubung),
 # jadi biaya runtime-nya ~nol sedangkan membuangnya mematikan
