@@ -265,6 +265,11 @@ struct Doc {
     error: Option<String>,
     zoom: f32,
     pan: Vec2,
+    /// Geometri scene() otomatis terakhir + posisinya — jangkar
+    /// route_partial: drag jadi operasi lokal (edge yang tak tersentuh
+    /// mempertahankan kualitas engine). None = belum ada / graph beda.
+    auto_scn: Option<Scene>,
+    auto_pos: Vec<(f64, f64)>,
     /// Pernah ada node yang digeser sejak buka/tata-ulang? Selama
     /// false, reparse menampilkan geometri `scene()` engine utuh
     /// (routing channel + slot label); `route()` baru dipakai untuk
@@ -298,6 +303,8 @@ impl Doc {
             error: None,
             zoom: 1.0,
             pan: Vec2::ZERO,
+            auto_scn: None,
+            auto_pos: Vec::new(),
             dragged: false,
         }
     }
@@ -347,6 +354,8 @@ struct App {
     zoom: f32,         // faktor zoom kanvas (1.0 = 100%)
     pan: Vec2,         // geseran kanvas, piksel layar
     canvas_size: Vec2, // ukuran kanvas frame terakhir (jangkar zoom via tombol)
+    auto_scn: Option<Scene>,  // scene() otomatis terakhir (lihat Doc::auto_scn)
+    auto_pos: Vec<(f64, f64)>,
     dragged: bool,     // dokumen aktif: sudah ada node yang digeser (lihat Doc::dragged)
 }
 
@@ -400,6 +409,8 @@ impl App {
             zoom: 1.0,
             pan: Vec2::ZERO,
             canvas_size: Vec2::ZERO,
+            auto_scn: None,
+            auto_pos: Vec::new(),
             dragged: false,
         };
         app.reparse();
@@ -535,6 +546,11 @@ impl App {
                     }
                 }
                 if self.dragged {
+                    // Sumber berubah saat posisi dipertahankan — jangkar
+                    // scene() lama tak lagi sejajar; route_partial akan
+                    // fallback ke route() sampai tata-ulang berikutnya.
+                    self.auto_scn = None;
+                    self.auto_pos.clear();
                     self.reroute();
                 } else {
                     // Semua posisi dari auto-layout — pakai geometri
@@ -551,7 +567,17 @@ impl App {
     fn reroute(&mut self) {
         self.clear_aux();
         match &self.model {
-            Model::Flow(g) => self.scn = route(g, &self.pos),
+            // Drag = operasi lokal: edge yang tak menyentuh node yang
+            // bergeser mempertahankan geometri scene() dari jangkar
+            // auto_scn; fallback route() penuh saat jangkar tak ada.
+            Model::Flow(g) => {
+                self.scn = match &self.auto_scn {
+                    Some(base) if base.nodes.len() == g.nodes.len() => {
+                        flowmaid::scene::route_partial(g, &self.pos, base, &self.auto_pos)
+                    }
+                    _ => route(g, &self.pos),
+                }
+            }
             Model::Er(d) => {
                 let es = er::route(d, &self.pos);
                 self.scn = es.scene;
@@ -619,6 +645,14 @@ impl App {
         // the mindmap arm already set its own (radial) centres above.
         if !matches!(self.model, Model::Mindmap(_)) {
             self.pos = self.scn.nodes.iter().map(|n| (n.x, n.y)).collect();
+        }
+        // Jangkar route_partial — hanya bermakna untuk flowchart/state.
+        if matches!(self.model, Model::Flow(_)) {
+            self.auto_scn = Some(self.scn.clone());
+            self.auto_pos = self.pos.clone();
+        } else {
+            self.auto_scn = None;
+            self.auto_pos.clear();
         }
     }
 
@@ -740,6 +774,8 @@ impl App {
         d.error = self.error.take();
         d.zoom = self.zoom;
         d.pan = self.pan;
+        d.auto_scn = self.auto_scn.take();
+        d.auto_pos = std::mem::take(&mut self.auto_pos);
         d.dragged = self.dragged;
     }
 
@@ -770,6 +806,8 @@ impl App {
         self.error = d.error.take();
         self.zoom = d.zoom;
         self.pan = d.pan;
+        self.auto_scn = d.auto_scn.take();
+        self.auto_pos = std::mem::take(&mut d.auto_pos);
         self.dragged = d.dragged;
     }
 
@@ -1906,7 +1944,7 @@ fn paint_diagram(
             let c = ts(*lx, *ly);
             let r = Rect::from_center_size(c, Vec2::new(*lw as f32, 20.0) * zoom);
             painter.rect(r, 4.0 * zoom, Color32::WHITE, Stroke::new(1.0 * zoom, LABEL_BORDER));
-            painter.text(c, Align2::CENTER_CENTER, t, zfont(13.0, zoom), TEXT);
+            draw_rich_text(painter, c, t, 13.0, zoom, TEXT);
         }
     }
     if is_class {
@@ -2482,13 +2520,52 @@ fn draw_node(p: &egui::Painter, n: &SceneNode, c: Pos2, zoom: f32, hovered: bool
             p.rect(r, round, fill, stroke);
         }
     }
-    p.text(
-        c,
-        Align2::CENTER_CENTER,
-        &n.label,
-        zfont(14.0, zoom),
-        text_color,
-    );
+    draw_rich_text(p, c, &n.label, 14.0, zoom, text_color);
+}
+
+/// Lukis label (multi-baris via '\n') ter-tengah di `c`; run `<b>`/`<i>`
+/// dari `flowmaid::layout::spans` digambar tebal — padanan tspan bold
+/// di SVG engine. egui tak membawa font bold, jadi bold di-faux dengan
+/// menggambar galley dua kali bergeser sub-piksel.
+fn draw_rich_text(
+    p: &egui::Painter,
+    c: Pos2,
+    label: &str,
+    size: f32,
+    zoom: f32,
+    color: Color32,
+) {
+    let lines: Vec<&str> = label.split('\n').collect();
+    let line_h = flowmaid::layout::LINE_H as f32 * zoom;
+    let font = zfont(size, zoom);
+    for (i, line) in lines.iter().enumerate() {
+        let y = c.y + (i as f32 - (lines.len() as f32 - 1.0) / 2.0) * line_h;
+        let runs = flowmaid::layout::spans(line);
+        if runs.len() == 1 && !runs[0].1 && !runs[0].2 {
+            p.text(
+                Pos2::new(c.x, y),
+                Align2::CENTER_CENTER,
+                &runs[0].0,
+                font.clone(),
+                color,
+            );
+            continue;
+        }
+        let galleys: Vec<_> = runs
+            .iter()
+            .map(|(t, _, _)| p.fonts(|f| f.layout_no_wrap(t.clone(), font.clone(), color)))
+            .collect();
+        let total: f32 = galleys.iter().map(|g| g.size().x).sum();
+        let mut x = c.x - total / 2.0;
+        for (g, (_, bold, _)) in galleys.into_iter().zip(&runs) {
+            let pos = Pos2::new(x, y - g.size().y / 2.0);
+            if *bold {
+                p.galley(pos + Vec2::new(0.4 * zoom.max(1.0), 0.0), g.clone(), color);
+            }
+            x += g.size().x;
+            p.galley(pos, g, color);
+        }
+    }
 }
 
 /// Tabel entitas ER: header berwarna + baris atribut
@@ -2973,18 +3050,53 @@ fn draw_seq_head(p: &egui::Painter, h: &seq::Head, ts: &impl Fn(f64, f64) -> Pos
     }
 }
 
-/// Kepala panah di ujung bezier, searah turunan kurva di t=1.
-/// Gambar spline Catmull-Rom melalui `pts` (>= 2 titik) sebagai
-/// rangkaian kubik — dipakai edge panjang yang di-route lewat channel.
+/// Gambar B-spline `curveBasis` (kurva d3 yang dipakai mermaid)
+/// melalui `pts` (>= 2 titik): mulai & berakhir tepat di ujung,
+/// waypoint tengah hanya DIDEKATI sehingga edge mengalir dalam jalur
+/// halus, tidak menggembung melewati tiap titik. Matematikanya sama
+/// dengan `spline_d` engine agar kanvas & ekspor SVG identik.
 fn draw_spline(p: &egui::Painter, pts: &[Pos2], stroke: Stroke, dotted: bool) {
     let n = pts.len();
-    for i in 0..n - 1 {
-        let p0 = pts[i.saturating_sub(1)];
-        let (p1, p2) = (pts[i], pts[i + 1]);
-        let p3 = pts[(i + 2).min(n - 1)];
-        let c1 = Pos2::new(p1.x + (p2.x - p0.x) / 6.0, p1.y + (p2.y - p0.y) / 6.0);
-        let c2 = Pos2::new(p2.x - (p3.x - p1.x) / 6.0, p2.y - (p3.y - p1.y) / 6.0);
-        let seg = [p1, c1, c2, p2];
+    let seg_line = |p: &egui::Painter, a: Pos2, b: Pos2| {
+        if dotted {
+            dashed_bezier(p, [a, a, b, b], stroke);
+        } else {
+            p.line_segment([a, b], stroke);
+        }
+    };
+    if n < 3 {
+        seg_line(p, pts[0], pts[n - 1]);
+        return;
+    }
+    seg_line(
+        p,
+        pts[0],
+        Pos2::new(
+            (5.0 * pts[0].x + pts[1].x) / 6.0,
+            (5.0 * pts[0].y + pts[1].y) / 6.0,
+        ),
+    );
+    // Kontrol bezier satu segmen basis untuk trio (a, b, q).
+    let bez = |a: Pos2, b: Pos2, q: Pos2| {
+        let c1 = Pos2::new((2.0 * a.x + b.x) / 3.0, (2.0 * a.y + b.y) / 3.0);
+        let c2 = Pos2::new((a.x + 2.0 * b.x) / 3.0, (a.y + 2.0 * b.y) / 3.0);
+        let end = Pos2::new((a.x + 4.0 * b.x + q.x) / 6.0, (a.y + 4.0 * b.y + q.y) / 6.0);
+        (c1, c2, end)
+    };
+    // Titik awal segmen pertama = hasil lineTo di atas; tiap segmen
+    // menyambung mulus karena B-spline C2-continuous.
+    let mut cur = Pos2::new(
+        (5.0 * pts[0].x + pts[1].x) / 6.0,
+        (5.0 * pts[0].y + pts[1].y) / 6.0,
+    );
+    for i in 2..=n {
+        let (a, b, q) = if i < n {
+            (pts[i - 2], pts[i - 1], pts[i])
+        } else {
+            (pts[n - 2], pts[n - 1], pts[n - 1])
+        };
+        let (c1, c2, end) = bez(a, b, q);
+        let seg = [cur, c1, c2, end];
         if dotted {
             dashed_bezier(p, seg, stroke);
         } else {
@@ -2995,7 +3107,9 @@ fn draw_spline(p: &egui::Painter, pts: &[Pos2], stroke: Stroke, dotted: bool) {
                 stroke,
             ));
         }
+        cur = end;
     }
+    seg_line(p, cur, pts[n - 1]);
 }
 
 fn arrow_head(p: &egui::Painter, b: [Pos2; 4], color: Color32, zoom: f32) {
