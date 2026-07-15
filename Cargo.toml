@@ -7,10 +7,9 @@ repository = "https://github.com/go-routine-id/flowmaid-desktop"
 publish = false # demo app — run from source
 
 [dependencies]
-# LOKAL sementara: path ke engine agar dapat `mindmap::route()` (drag)
-# yang belum dirilis; sumber flowmaid sama dengan markmaid → tipe unifikasi.
-# Kembalikan ke `flowmaid = "0.13"` setelah 0.13.1 rilis.
-flowmaid = { path = "../diagram-engine-studio/flowrs" }
+# 0.14 = rilis dengan mindmap (radial + route/drag) & journey; versi yang
+# sama dipakai markmaid sehingga tipe flowmaid-nya terunifikasi.
+flowmaid = "0.14"
 # Fitur default dipertahankan: accesskit TIDAK dibuang — pohon
 # aksesibilitasnya lazy (baru dibangun saat screen reader terhubung),
 # jadi biaya runtime-nya ~nol sedangkan membuangnya mematikan
