@@ -1817,41 +1817,55 @@ fn paint_diagram(
         if matches!(e.kind, EdgeKind::Invisible) {
             continue; // link penata layout — tidak digambar
         }
-        let p = e.bezier.map(|(x, y)| ts(x, y));
         let sw = (if matches!(e.kind, EdgeKind::Thick | EdgeKind::ThickOpen) {
             3.4
         } else {
             1.7
         }) * zoom;
         let stroke = Stroke::new(sw, EDGE);
-        if matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen) {
-            dashed_bezier(painter, p, stroke);
-        } else {
-            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
-                p,
-                false,
-                Color32::TRANSPARENT,
-                stroke,
-            ));
-        }
-        if is_class {
-            // Glyph UML di ujung `to`; kardinalitas di kedua sisi.
-            // `.get` menjaga andai edge & rels tak sejajar.
-            if let Some(rel) = d.rels.get(i) {
-                draw_head(painter, &class::head(e.bezier[3], e.bezier[2], rel.kind), ts, zoom);
-                if let Some(c) = &rel.from_card {
-                    draw_card(painter, e.bezier[0], e.bezier[1], c, ts, zoom);
-                }
-                if let Some(c) = &rel.to_card {
-                    draw_card(painter, e.bezier[3], e.bezier[2], c, ts, zoom);
-                }
+        let dotted = matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen);
+        if !e.waypoints.is_empty() {
+            // Edge panjang di-route lewat channel virtual-node: spline
+            // Catmull-Rom melalui waypoint-nya (mirip mermaid). Hanya
+            // flowchart yang punya waypoint (bukan class/ER), jadi cukup
+            // panah di ujung — tanpa glyph.
+            let pts: Vec<Pos2> = e.waypoints.iter().map(|&(x, y)| ts(x, y)).collect();
+            draw_spline(painter, &pts, stroke, dotted);
+            if e.kind.has_arrow() {
+                let n = pts.len();
+                arrow_head(painter, [pts[n - 2], pts[n - 2], pts[n - 2], pts[n - 1]], EDGE, zoom);
             }
-        } else if let Some(&(cf, ct)) = d.cards.get(i).filter(|_| is_er) {
-            // Notasi crow's foot di kedua ujung relasi ER.
-            draw_glyph(painter, &er::glyph(e.bezier[0], e.bezier[1], cf), ts, zoom);
-            draw_glyph(painter, &er::glyph(e.bezier[3], e.bezier[2], ct), ts, zoom);
-        } else if e.kind.has_arrow() {
-            arrow_head(painter, p, EDGE, zoom);
+        } else {
+            let p = e.bezier.map(|(x, y)| ts(x, y));
+            if dotted {
+                dashed_bezier(painter, p, stroke);
+            } else {
+                painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                    p,
+                    false,
+                    Color32::TRANSPARENT,
+                    stroke,
+                ));
+            }
+            if is_class {
+                // Glyph UML di ujung `to`; kardinalitas di kedua sisi.
+                // `.get` menjaga andai edge & rels tak sejajar.
+                if let Some(rel) = d.rels.get(i) {
+                    draw_head(painter, &class::head(e.bezier[3], e.bezier[2], rel.kind), ts, zoom);
+                    if let Some(c) = &rel.from_card {
+                        draw_card(painter, e.bezier[0], e.bezier[1], c, ts, zoom);
+                    }
+                    if let Some(c) = &rel.to_card {
+                        draw_card(painter, e.bezier[3], e.bezier[2], c, ts, zoom);
+                    }
+                }
+            } else if let Some(&(cf, ct)) = d.cards.get(i).filter(|_| is_er) {
+                // Notasi crow's foot di kedua ujung relasi ER.
+                draw_glyph(painter, &er::glyph(e.bezier[0], e.bezier[1], cf), ts, zoom);
+                draw_glyph(painter, &er::glyph(e.bezier[3], e.bezier[2], ct), ts, zoom);
+            } else if e.kind.has_arrow() {
+                arrow_head(painter, p, EDGE, zoom);
+            }
         }
         if let Some((t, (lx, ly), lw)) = &e.label {
             let c = ts(*lx, *ly);
@@ -2925,6 +2939,30 @@ fn draw_seq_head(p: &egui::Painter, h: &seq::Head, ts: &impl Fn(f64, f64) -> Pos
 }
 
 /// Kepala panah di ujung bezier, searah turunan kurva di t=1.
+/// Gambar spline Catmull-Rom melalui `pts` (>= 2 titik) sebagai
+/// rangkaian kubik — dipakai edge panjang yang di-route lewat channel.
+fn draw_spline(p: &egui::Painter, pts: &[Pos2], stroke: Stroke, dotted: bool) {
+    let n = pts.len();
+    for i in 0..n - 1 {
+        let p0 = pts[i.saturating_sub(1)];
+        let (p1, p2) = (pts[i], pts[i + 1]);
+        let p3 = pts[(i + 2).min(n - 1)];
+        let c1 = Pos2::new(p1.x + (p2.x - p0.x) / 6.0, p1.y + (p2.y - p0.y) / 6.0);
+        let c2 = Pos2::new(p2.x - (p3.x - p1.x) / 6.0, p2.y - (p3.y - p1.y) / 6.0);
+        let seg = [p1, c1, c2, p2];
+        if dotted {
+            dashed_bezier(p, seg, stroke);
+        } else {
+            p.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                seg,
+                false,
+                Color32::TRANSPARENT,
+                stroke,
+            ));
+        }
+    }
+}
+
 fn arrow_head(p: &egui::Painter, b: [Pos2; 4], color: Color32, zoom: f32) {
     let tip = b[3];
     let d = tip - b[2];

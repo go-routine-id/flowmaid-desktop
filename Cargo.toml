@@ -9,7 +9,7 @@ publish = false # demo app — run from source
 [dependencies]
 # 0.14 = rilis dengan mindmap (radial + route/drag) & journey; versi yang
 # sama dipakai markmaid sehingga tipe flowmaid-nya terunifikasi.
-flowmaid = "0.14"
+flowmaid = "0.15"
 # Fitur default dipertahankan: accesskit TIDAK dibuang — pohon
 # aksesibilitasnya lazy (baru dibangun saat screen reader terhubung),
 # jadi biaya runtime-nya ~nol sedangkan membuangnya mematikan
