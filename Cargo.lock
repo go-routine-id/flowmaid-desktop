@@ -1815,7 +1815,7 @@ dependencies = [
 [[package]]
 name = "markmaid"
 version = "0.2.0"
-source = "git+https://github.com/go-routine-id/markmaid#f2b36d6466cb5242fbb949f451108e34e156e2c6"
+source = "git+https://github.com/go-routine-id/markmaid#00cda1e838570e217a757f3e643da93ea1f26e95"
 dependencies = [
  "flowmaid",
 ]

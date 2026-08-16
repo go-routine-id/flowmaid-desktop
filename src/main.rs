@@ -2765,6 +2765,32 @@ fn paint_markmaid_table(
     );
 }
 
+/// Lukis satu code block (``` ... ```) plus tombol Copy di pojok kanan atas.
+fn paint_markmaid_code_block(
+    ui: &mut egui::Ui,
+    cz: &markmaid::CodeBlockZone,
+    origin: Pos2,
+) {
+    let block_min = origin + Vec2::new(cz.x as f32, cz.y as f32);
+    let btn_size = 24.0_f32;
+    let pad = 4.0_f32;
+    let btn_min = block_min
+        + Vec2::new(
+            (cz.w as f32 - btn_size - pad).max(pad),
+            pad,
+        );
+    let btn_rect = Rect::from_min_size(btn_min, Vec2::new(btn_size, btn_size));
+    ui.allocate_new_ui(
+        egui::UiBuilder::new().max_rect(btn_rect),
+        |ui| {
+            ui.set_min_size(Vec2::new(btn_size, btn_size));
+            if ui.button("📋").on_hover_text("Salin ke clipboard").clicked() {
+                ui.ctx().copy_text(cz.source.clone());
+            }
+        },
+    );
+}
+
 /// Lukis satu `DocScene` markmaid ke `ui`, berpangkal di `origin`
 /// (skala 1:1 — layout sudah dihitung pada lebar panel). Diagram bisa
 /// diklik untuk dibuka sebagai tab (lewat `open_req`); tautan yang
@@ -2784,12 +2810,31 @@ fn paint_docscene(
     let blank = blank_scene(0.0, 0.0);
     let mut diagram_ord = 0usize;
     let mut table_idx = 0usize;
+    let mut code_block_idx = 0usize;
     let mut i = 0;
     while i < view.scene.items.len() {
         if let Some(tz) = view.scene.tables.get(table_idx).filter(|tz| tz.items.start == i) {
             paint_markmaid_table(ui, view, tz, origin, &vis, &blank, open_req, &mut diagram_ord);
             i = tz.items.end;
             table_idx += 1;
+            continue;
+        }
+        if let Some(cz) = view.scene.code_blocks.get(code_block_idx).filter(|cz| cz.items.start == i) {
+            for item in &view.scene.items[cz.items.clone()] {
+                paint_markmaid_item(
+                    ui,
+                    view,
+                    item,
+                    origin,
+                    &vis,
+                    &blank,
+                    open_req,
+                    &mut diagram_ord,
+                );
+            }
+            paint_markmaid_code_block(ui, cz, origin);
+            i = cz.items.end;
+            code_block_idx += 1;
             continue;
         }
         paint_markmaid_item(
