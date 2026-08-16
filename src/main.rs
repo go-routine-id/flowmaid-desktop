@@ -26,14 +26,14 @@ use flowmaid::er::{self, ErTable};
 use flowmaid::journey::{self, JourneyScene};
 use flowmaid::mindmap::{self, MindScene};
 use flowmaid::model::{
-    Card, ClassDiagram, EdgeKind, ErDiagram, Graph, Journey, Mindmap, PieChart, SequenceDiagram,
-    Shape,
+    Architecture, Card, ClassDiagram, EdgeKind, ErDiagram, GitGraph, Graph, Journey, Mindmap,
+    PieChart, SequenceDiagram, Shape,
 };
 use flowmaid::pie::{self, PieScene};
 use flowmaid::scene::{route, scene, to_svg, Scene, SceneNode};
 use flowmaid::seq::{self, SeqScene};
 use flowmaid::Document;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -162,7 +162,20 @@ fn main() -> eframe::Result<()> {
             // open_path, supaya routing .md → blok mermaid dan
             // dedupe tab berlaku seragam. (Dulu argumen CLI dibaca
             // mentah ke editor: file .md gagal parse → preview kosong.)
+            // Folder explorer yang terbuka di sesi sebelumnya.
+            let open_dirs: HashSet<PathBuf> = cc
+                .storage
+                .and_then(|s| s.get_string("open_dirs"))
+                .map(|s| {
+                    s.lines()
+                        .filter(|l| !l.is_empty())
+                        .map(PathBuf::from)
+                        .filter(|p| p.is_dir())
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut app = App::new(CONTOH.to_string(), None, recent, workspace);
+            app.open_dirs = open_dirs;
             for p in tabs {
                 app.open_path(p);
             }
@@ -202,6 +215,8 @@ enum Model {
     Sequence(SequenceDiagram),
     Mindmap(Mindmap),
     Journey(Journey),
+    GitGraph(GitGraph),
+    Architecture(Architecture),
 }
 
 impl Model {
@@ -215,6 +230,7 @@ impl Model {
             Model::Class(d) => d.classes.iter().map(|c| c.name.as_str()).collect(),
             Model::Mindmap(m) => m.nodes.iter().map(|n| n.text.as_str()).collect(),
             Model::Pie(_) | Model::Sequence(_) | Model::Journey(_) => Vec::new(),
+            Model::GitGraph(_) | Model::Architecture(_) => Vec::new(),
         }
     }
 }
@@ -326,6 +342,11 @@ struct App {
     // & terurut; Err = pesan gagal baca (mis. folder tercabut).
     // Rc: draw_tree meminjam listing tanpa deep-clone per frame.
     dir_cache: HashMap<PathBuf, Rc<Result<Vec<TreeEntry>, String>>>,
+    // Folder explorer yang sedang terbuka (tak ada di set = terlipat);
+    // dipersist antar-sesi seperti VSCode. Header section melipat
+    // seluruh pohon lewat tree_root_open.
+    open_dirs: HashSet<PathBuf>,
+    tree_root_open: bool,
     view: View,               // tab aktif: Preview / Code
     pending: Option<Pending>, // aksi menunggu konfirmasi buang-perubahan
     last_title: String,
@@ -377,6 +398,8 @@ impl App {
             recent,
             workspace,
             dir_cache: HashMap::new(),
+            open_dirs: HashSet::new(),
+            tree_root_open: true,
             view: View::Split,
             pending: None,
             last_title: String::new(),
@@ -385,13 +408,7 @@ impl App {
             last_titled_tab: usize::MAX,
             model: Model::Flow(Graph::default()),
             pos: Vec::new(),
-            scn: Scene {
-                nodes: Vec::new(),
-                edges: Vec::new(),
-                clusters: Vec::new(),
-                width: 0.0,
-                height: 0.0,
-            },
+            scn: blank_scene(0.0, 0.0),
             tables: Vec::new(),
             cards: Vec::new(),
             boxes: Vec::new(),
@@ -544,6 +561,13 @@ impl App {
                             .collect();
                         self.model = Model::Mindmap(d);
                     }
+                    // Static, auto-laid-out: no per-node drag state.
+                    Document::GitGraph(d) => {
+                        self.model = Model::GitGraph(d);
+                    }
+                    Document::Architecture(d) => {
+                        self.model = Model::Architecture(d);
+                    }
                 }
                 if self.dragged {
                     // Sumber berubah saat posisi dipertahankan — jangkar
@@ -600,6 +624,14 @@ impl App {
                 self.scn = blank_scene(ms.width, ms.height);
                 self.mind = Some(ms);
             }
+            Model::GitGraph(d) => {
+                let gs = flowmaid::gitgraph::scene(d);
+                self.scn = gs.scene;
+            }
+            Model::Architecture(d) => {
+                let as_ = flowmaid::architecture::scene(d);
+                self.scn = as_.scene;
+            }
         }
     }
 
@@ -639,6 +671,14 @@ impl App {
                 self.pos = ms.nodes.iter().map(|n| (n.cx(), n.cy())).collect();
                 self.scn = blank_scene(ms.width, ms.height);
                 self.mind = Some(ms);
+            }
+            Model::GitGraph(d) => {
+                let gs = flowmaid::gitgraph::scene(d);
+                self.scn = gs.scene;
+            }
+            Model::Architecture(d) => {
+                let as_ = flowmaid::architecture::scene(d);
+                self.scn = as_.scene;
             }
         }
         // Scene-based types re-seed positions from the laid-out nodes;
@@ -719,6 +759,10 @@ impl App {
             // Reflect any dragging via route() over the live positions.
             Model::Mindmap(d) => mindmap::to_svg(&mindmap::route(d, &self.pos)),
             Model::Journey(d) => journey::to_svg(&journey::scene(d)),
+            Model::GitGraph(d) => flowmaid::gitgraph::to_svg(&flowmaid::gitgraph::scene(d)),
+            Model::Architecture(d) => {
+                flowmaid::architecture::to_svg(&flowmaid::architecture::scene(d))
+            }
         }
     }
 
@@ -1218,10 +1262,14 @@ impl App {
         rc
     }
 
-    /// Pohon file rekursif untuk explorer: folder bisa dilipat,
-    /// file `.mmd`/`.txt` bisa diklik untuk dibuka (lewat penjaga
-    /// perubahan-belum-disimpan), file aktif di-highlight.
-    fn draw_tree(&mut self, ui: &mut egui::Ui, dir: &Path) {
+    /// Pohon file rekursif ala explorer VSCode: baris digambar manual
+    /// (bukan CollapsingHeader) demi highlight hover/aktif selebar
+    /// panel, chevron + ikon vektor, indent guide, dan nama satu baris
+    /// ter-ellipsis. Klik folder melipat via `open_dirs`; klik file
+    /// membuka tab (file aktif di-highlight).
+    fn draw_tree(&mut self, ui: &mut egui::Ui, dir: &Path, depth: usize) {
+        const ROW_H: f32 = 22.0;
+        const INDENT: f32 = 10.0;
         // Rc lokal menahan data hidup — rekursi &mut self tetap aman
         // walau cache dievict di tengah jalan.
         let listing = self.listing(dir);
@@ -1236,16 +1284,131 @@ impl App {
             }
         };
         for t in entries {
-            if t.is_dir {
-                egui::CollapsingHeader::new(&t.name)
-                    .id_salt(&t.path)
-                    .default_open(false)
-                    .show(ui, |ui| self.draw_tree(ui, &t.path));
-            } else {
-                let selected = self.path.as_deref() == Some(t.path.as_path());
-                if ui.selectable_label(selected, &t.name).clicked() && !selected {
+            // Alokasi hanya menentukan tinggi baris; interaksi dipasang
+            // pada rect selebar panel supaya area klik = area highlight
+            // (allocate + Sense::click hanya seluas rect ber-margin).
+            let (_, rect) = ui.allocate_space(Vec2::new(ui.available_width(), ROW_H));
+            let row = Rect::from_x_y_ranges(ui.clip_rect().x_range(), rect.y_range());
+            let mut resp = ui.interact(row, egui::Id::new(("tree-row", &t.path)), Sense::click());
+            let open = t.is_dir && self.open_dirs.contains(&t.path);
+            let selected = !t.is_dir && self.path.as_deref() == Some(t.path.as_path());
+            // Tanpa info widget, baris manual = node anonim bagi screen
+            // reader (AccessKit sengaja dipertahankan — lihat Cargo.toml).
+            resp.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::SelectableLabel,
+                    true,
+                    selected || open,
+                    &t.name,
+                )
+            });
+            if ui.is_rect_visible(rect) {
+                let v = ui.visuals().clone();
+                let p = ui.painter();
+                if selected {
+                    p.rect_filled(row, 0.0, v.selection.bg_fill.gamma_multiply(0.55));
+                } else if resp.hovered() {
+                    let c = if v.dark_mode {
+                        Color32::from_white_alpha(10)
+                    } else {
+                        Color32::from_black_alpha(10)
+                    };
+                    p.rect_filled(row, 0.0, c);
+                }
+                // Fokus keyboard (Tab lalu Enter/Space) harus terlihat.
+                if resp.has_focus() {
+                    p.rect_stroke(row.shrink(0.5), 0.0, v.selection.stroke);
+                }
+                let x0 = rect.left() + 4.0 + depth as f32 * INDENT;
+                let cy = rect.center().y;
+                // Indent guide tipis di kolom chevron tiap leluhur.
+                let guide = if v.dark_mode {
+                    Color32::from_white_alpha(14)
+                } else {
+                    Color32::from_black_alpha(20)
+                };
+                for l in 0..depth {
+                    let gx = rect.left() + 4.0 + l as f32 * INDENT + 5.0;
+                    p.line_segment(
+                        [Pos2::new(gx, rect.top()), Pos2::new(gx, rect.bottom())],
+                        Stroke::new(1.0, guide),
+                    );
+                }
+                let muted = v.weak_text_color();
+                if t.is_dir {
+                    chevron(p, Pos2::new(x0 + 5.0, cy), open, Stroke::new(1.5, muted));
+                    // Ikon folder: tab kecil + badan.
+                    let fx = x0 + 13.0;
+                    let fill = muted.gamma_multiply(0.8);
+                    p.rect_filled(
+                        Rect::from_min_size(Pos2::new(fx, cy - 5.5), Vec2::new(5.0, 2.5)),
+                        1.0,
+                        fill,
+                    );
+                    p.rect_filled(
+                        Rect::from_min_size(Pos2::new(fx, cy - 3.8), Vec2::new(11.0, 8.8)),
+                        1.5,
+                        fill,
+                    );
+                } else {
+                    // Ikon file: halaman bergaris, warna per jenis file.
+                    let ext = t
+                        .path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_ascii_lowercase());
+                    // Varian lebih gelap di tema terang agar kontras.
+                    let tint = match (ext.as_deref(), v.dark_mode) {
+                        (Some("mmd"), true) => Color32::from_rgb(0xc9, 0x71, 0xb8),
+                        (Some("mmd"), false) => Color32::from_rgb(0x9c, 0x3f, 0x8c),
+                        (Some("md" | "markdown"), true) => Color32::from_rgb(0x5f, 0xa8, 0xd3),
+                        (Some("md" | "markdown"), false) => Color32::from_rgb(0x2c, 0x6f, 0x94),
+                        _ => muted,
+                    };
+                    let fx = x0 + 14.0;
+                    p.rect_stroke(
+                        Rect::from_min_size(Pos2::new(fx, cy - 5.5), Vec2::new(9.0, 11.0)),
+                        1.0,
+                        Stroke::new(1.2, tint),
+                    );
+                    let ink = Stroke::new(1.0, tint.gamma_multiply(0.7));
+                    for (dy, len) in [(-1.5, 5.0), (1.0, 5.0), (3.5, 3.0)] {
+                        p.line_segment(
+                            [Pos2::new(fx + 2.0, cy + dy), Pos2::new(fx + 2.0 + len, cy + dy)],
+                            ink,
+                        );
+                    }
+                }
+                // Nama: satu baris, sisa lebar, dipotong dengan ….
+                let tx = x0 + 28.0;
+                let color = if selected { v.strong_text_color() } else { v.text_color() };
+                let galley = ellipsized(
+                    ui,
+                    &t.name,
+                    FontId::proportional(13.0),
+                    color,
+                    (rect.right() - 6.0 - tx).max(8.0),
+                );
+                // Nama yang terpotong tetap terbaca utuh via tooltip.
+                if galley.elided {
+                    resp = resp.on_hover_text(&t.name);
+                }
+                let ty = cy - galley.size().y * 0.5;
+                ui.painter().galley(Pos2::new(tx, ty), galley, color);
+            }
+            if resp.clicked() {
+                if t.is_dir {
+                    if open {
+                        self.open_dirs.remove(&t.path);
+                    } else {
+                        self.open_dirs.insert(t.path.clone());
+                    }
+                } else if !selected {
                     self.open_path(t.path.clone());
                 }
+            }
+            if t.is_dir && open {
+                self.draw_tree(ui, &t.path, depth + 1);
             }
         }
     }
@@ -1270,6 +1433,37 @@ impl App {
     }
 }
 
+/// Chevron ▸/▾ ala VSCode, digambar dua garis — glyph panah font
+/// tidak seragam antar-platform.
+fn chevron(p: &egui::Painter, c: Pos2, open: bool, stroke: Stroke) {
+    if open {
+        p.line_segment([Pos2::new(c.x - 3.2, c.y - 1.6), Pos2::new(c.x, c.y + 1.9)], stroke);
+        p.line_segment([Pos2::new(c.x, c.y + 1.9), Pos2::new(c.x + 3.2, c.y - 1.6)], stroke);
+    } else {
+        p.line_segment([Pos2::new(c.x - 1.6, c.y - 3.2), Pos2::new(c.x + 1.9, c.y)], stroke);
+        p.line_segment([Pos2::new(c.x + 1.9, c.y), Pos2::new(c.x - 1.6, c.y + 3.2)], stroke);
+    }
+}
+
+/// Galley satu baris yang dipotong dengan '…' bila melebihi `max_w` —
+/// nama file panjang tidak boleh wrap seperti label egui default.
+fn ellipsized(
+    ui: &egui::Ui,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_w: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
+    job.wrap = egui::text::TextWrapping {
+        max_width: max_w,
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    ui.fonts(|f| f.layout_job(job))
+}
+
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string("recent", self.recent.join("\n"));
@@ -1289,6 +1483,8 @@ impl eframe::App for App {
             })
             .collect();
         storage.set_string("tabs", tabs.join("\n"));
+        let dirs: Vec<String> = self.open_dirs.iter().map(|p| p.display().to_string()).collect();
+        storage.set_string("open_dirs", dirs.join("\n"));
     }
 
     // Catatan audit: persist_egui_memory sengaja DIBIARKAN default
@@ -1467,10 +1663,11 @@ impl eframe::App for App {
             .width_range(160.0..=440.0)
             .show(ctx, |ui| match self.workspace.clone() {
                 Some(ws) => {
+                    // Section header ala VSCode: chevron + nama folder
+                    // tebal (klik melipat seluruh pohon); menu aksi
+                    // tetap di kanan dan nama terpotong rapi.
+                    ui.add_space(2.0);
                     ui.horizontal(|ui| {
-                        // Menu aksi dipasang lebih dulu di kanan, lalu
-                        // nama folder mengisi sisa ruang & terpotong
-                        // rapi bila panjang.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.menu_button("...", |ui| {
                                 if ui.button("Segarkan").clicked() {
@@ -1483,23 +1680,67 @@ impl eframe::App for App {
                                     ui.close_menu();
                                 }
                             });
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(
-                                        ws.file_name()
-                                            .map(|n| n.to_string_lossy().to_uppercase())
-                                            .unwrap_or_else(|| "FOLDER".into()),
-                                    )
-                                    .strong(),
-                                )
-                                .truncate(),
+                            let (rect, resp) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 20.0),
+                                Sense::click(),
                             );
+                            let name = ws
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_uppercase())
+                                .unwrap_or_else(|| "FOLDER".into());
+                            resp.widget_info(|| {
+                                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name)
+                            });
+                            if ui.is_rect_visible(rect) {
+                                let v = ui.visuals().clone();
+                                if resp.has_focus() {
+                                    ui.painter().rect_stroke(
+                                        rect.shrink(0.5),
+                                        0.0,
+                                        v.selection.stroke,
+                                    );
+                                }
+                                chevron(
+                                    ui.painter(),
+                                    Pos2::new(rect.left() + 7.0, rect.center().y),
+                                    self.tree_root_open,
+                                    Stroke::new(1.5, v.weak_text_color()),
+                                );
+                                let galley = ellipsized(
+                                    ui,
+                                    &name,
+                                    FontId::proportional(11.5),
+                                    v.strong_text_color(),
+                                    (rect.width() - 22.0).max(8.0),
+                                );
+                                let pos = Pos2::new(
+                                    rect.left() + 17.0,
+                                    rect.center().y - galley.size().y * 0.5,
+                                );
+                                // Faux bold: egui tak membawa font bold.
+                                ui.painter().galley(
+                                    pos,
+                                    std::sync::Arc::clone(&galley),
+                                    v.strong_text_color(),
+                                );
+                                ui.painter().galley(
+                                    pos + Vec2::new(0.4, 0.0),
+                                    galley,
+                                    v.strong_text_color(),
+                                );
+                            }
+                            if resp.clicked() {
+                                self.tree_root_open = !self.tree_root_open;
+                            }
                         });
                     });
-                    ui.separator();
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        self.draw_tree(ui, &ws);
-                    });
+                    if self.tree_root_open {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            self.draw_tree(ui, &ws, 0);
+                            ui.add_space(4.0);
+                        });
+                    }
                 }
                 None => {
                     ui.add_space(8.0);
@@ -1595,6 +1836,12 @@ impl eframe::App for App {
                                     let n: usize = d.sections.iter().map(|s| s.tasks.len()).sum();
                                     format!("journey · {} task", n)
                                 }
+                                Model::GitGraph(d) => {
+                                    format!("gitGraph · {} commit", d.commits.len())
+                                }
+                                Model::Architecture(d) => {
+                                    format!("architecture · {} service", d.services.len())
+                                }
                             }
                         };
                         ui.weak(kind);
@@ -1657,7 +1904,7 @@ impl App {
                 // Layout hanya dihitung ulang saat lebar berubah —
                 // mengetik/scroll tidak membayar layout tiap frame.
                 if (width - mdoc.laid_width).abs() > 0.5 {
-                    mdoc.relayout(width);
+                    ui.fonts(|fonts| mdoc.relayout(width, fonts));
                 }
                 let size = Vec2::new(mdoc.scene.width as f32, mdoc.scene.height as f32);
                 let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
@@ -1984,10 +2231,57 @@ struct MdView {
 
 impl MdView {
     /// Hitung ulang geometri untuk lebar konten `width` (px).
-    fn relayout(&mut self, width: f32) {
+    ///
+    /// `fonts` adalah snapshot font egui yang AKTUAL dipakai melukis.
+    /// markmaid menerima metrik lebar teks dari konsumer (bukan
+    /// estimasi built-in) supaya wrapping, posisi, dan chip `inline
+    /// code` sejajar persis dengan glyph yang benar-benar digambar —
+    /// ini yang memperbaiki layout "melenceng" untuk dokumen kompleks.
+    fn relayout(&mut self, width: f32, fonts: &egui::text::Fonts) {
+        // Klon murah (Arc) — dipindah ke closure yang harus 'static.
+        let fonts = fonts.clone();
+        let measure = markmaid::Measure::custom(
+            move |text: &str, size: f64, mono: bool, em: bool| {
+                use egui::text::{LayoutJob, TextFormat};
+                let font_id = if mono {
+                    egui::FontId::monospace(size as f32)
+                } else {
+                    egui::FontId::proportional(size as f32)
+                };
+                // Sama persis dengan `paint_docscene`: hanya `em`
+                // (italic) yang mengubah lebar glyph — `strong` digambar
+                // sebagai WARNA, bukan font tebal, jadi tak ikut diukur.
+                let mut job = LayoutJob::default();
+                job.append(
+                    text,
+                    0.0,
+                    TextFormat {
+                        font_id,
+                        italics: em,
+                        ..Default::default()
+                    },
+                );
+                fonts.layout_job(job).size().x as f64
+            },
+        );
         let opts = markmaid::LayoutOptions {
             width: width as f64,
             base_size: 14.0,
+            measure,
+        };
+        self.scene = markmaid::layout(&self.doc, &opts);
+        self.laid_width = width;
+    }
+
+    /// Layout dengan metrik estimasi bawaan markmaid (tanpa font egui).
+    /// Dipakai jalur SVG/HTML dan tes — geometri yang konsisten dengan
+    /// writer bawaan, bukan dengan glyph egui di layar.
+    #[cfg(test)]
+    fn relayout_estimated(&mut self, width: f32) {
+        let opts = markmaid::LayoutOptions {
+            width: width as f64,
+            base_size: 14.0,
+            measure: markmaid::Measure::Estimated,
         };
         self.scene = markmaid::layout(&self.doc, &opts);
         self.laid_width = width;
@@ -2116,6 +2410,9 @@ fn paint_embedded(
         // edge) — punya painter sendiri.
         V::Mind(ms) => draw_mindmap(painter, ms, ts, zoom),
         V::Journey(jsc) => draw_journey(painter, jsc, ts, zoom),
+        // Static topologi (node/edge/cluster) lewat `Scene` generik.
+        V::Git(gs) => paint_diagram(painter, &base_refs(&gs.scene), None, ts, zoom, false),
+        V::Arch(as_) => paint_diagram(painter, &base_refs(&as_.scene), None, ts, zoom, false),
     }
 }
 
@@ -2777,13 +3074,7 @@ fn draw_card(
 /// Scene kosong dengan ukuran kanvas — dipakai diagram statis
 /// (pie/sequence) yang tak punya node yang bisa digeser.
 fn blank_scene(width: f64, height: f64) -> Scene {
-    Scene {
-        nodes: Vec::new(),
-        edges: Vec::new(),
-        clusters: Vec::new(),
-        width,
-        height,
-    }
+    Scene::empty(width, height)
 }
 
 /// Garis putus-putus lurus (egui tak punya dash bawaan) dalam
@@ -3367,7 +3658,7 @@ mod tests {
         // Parse+layout markmaid: dua diagram tertanam, heading, dan
         // fence non-mermaid jadi blok kode biasa.
         let mut rendered = build_mdview(md);
-        rendered.relayout(600.0);
+        rendered.relayout_estimated(600.0);
         let diagrams = rendered
             .scene
             .items
@@ -3433,7 +3724,7 @@ mod tests {
                   - [x] beres\n- [ ] belum\n- biasa\n";
         // Pipeline markmaid penuh: parse → layout → DocScene.
         let mut v = build_mdview(md);
-        v.relayout(600.0);
+        v.relayout_estimated(600.0);
         let items = &v.scene.items;
         // Tautan → zona klik dengan URL-nya (bisa dibuka browser).
         assert!(
