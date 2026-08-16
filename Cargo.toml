@@ -15,9 +15,12 @@ flowmaid = "0.24"
 # VoiceOver/NVDA (temuan verifikasi audit memory).
 eframe = { version = "0.29", features = ["persistence"] }
 rfd = "0.17.2"
-# Mesin render Markdown (parse + layout → DocScene). Dipakai lokal via
-# path dep (BELUM dipublish beriringan) — tarik flowmaid yang sama.
-markmaid = { path = "../markmaid" }
+# Mesin render Markdown (parse + layout → DocScene). Dipakai dari repo
+# markmaid via git supaya CI flowmaid-desktop bisa build tanpa path sibling.
+# Untuk co-development lokal, override dengan:
+#   [patch."https://github.com/go-routine-id/markmaid"]
+#   markmaid = { path = "../markmaid" }
+markmaid = { git = "https://github.com/go-routine-id/markmaid" }
 
 # Rampingkan binary release dan bantu inlining lintas-crate.
 [profile.release]
