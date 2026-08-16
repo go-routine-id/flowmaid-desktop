@@ -1907,8 +1907,8 @@ impl App {
                     ui.fonts(|fonts| mdoc.relayout(width, fonts));
                 }
                 let size = Vec2::new(mdoc.scene.width as f32, mdoc.scene.height as f32);
-                let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
-                paint_docscene(ui, &painter, &mdoc, resp.rect.min, &mut open_req);
+                let (resp, _painter) = ui.allocate_painter(size, egui::Sense::hover());
+                paint_docscene(ui, &mdoc, resp.rect.min, &mut open_req);
             });
         self.mdoc = Some(mdoc);
         if let Some(i) = open_req {
@@ -2268,6 +2268,7 @@ impl MdView {
             width: width as f64,
             base_size: 14.0,
             measure,
+            table_overflow: markmaid::TableOverflow::Natural,
         };
         self.scene = markmaid::layout(&self.doc, &opts);
         self.laid_width = width;
@@ -2282,6 +2283,7 @@ impl MdView {
             width: width as f64,
             base_size: 14.0,
             measure: markmaid::Measure::Estimated,
+            table_overflow: markmaid::TableOverflow::Natural,
         };
         self.scene = markmaid::layout(&self.doc, &opts);
         self.laid_width = width;
@@ -2586,21 +2588,194 @@ fn draw_journey(
     }
 }
 
-/// Lukis satu `DocScene` markmaid ke `painter`, berpangkal di `origin`
+/// Test whether a link zone lies inside a table's natural scroll area.
+fn link_in_zone(lz: &markmaid::LinkZone, tz: &markmaid::TableZone) -> bool {
+    lz.x >= tz.x
+        && lz.x + lz.w <= tz.x + tz.natural_w + 1e-6
+        && lz.y >= tz.y
+        && lz.y + lz.h <= tz.y + tz.h + 1e-6
+}
+
+/// Lukis satu item markmaid dengan origin layar yang diberikan.
+#[allow(clippy::too_many_arguments)]
+fn paint_markmaid_item(
+    ui: &mut egui::Ui,
+    view: &MdView,
+    item: &markmaid::Item,
+    origin: Pos2,
+    vis: &egui::Visuals,
+    blank: &Scene,
+    open_req: &mut Option<usize>,
+    diagram_ord: &mut usize,
+) {
+    use egui::text::{LayoutJob, TextFormat};
+    use markmaid::ColorRole;
+
+    let at = |x: f64, y: f64| origin + Vec2::new(x as f32, y as f32);
+    match item {
+        markmaid::Item::Rect(r) => {
+            let rect = Rect::from_min_size(at(r.x, r.y), Vec2::new(r.w as f32, r.h as f32));
+            let fill = r.fill.map_or(Color32::TRANSPARENT, |f| role(vis, f));
+            let stroke = r.stroke.map_or(Stroke::NONE, |s| Stroke::new(1.0, role(vis, s)));
+            ui.painter().rect(rect, r.rounding as f32, fill, stroke);
+        }
+        markmaid::Item::Line(l) => {
+            ui.painter().line_segment(
+                [at(l.x1, l.y1), at(l.x2, l.y2)],
+                Stroke::new(1.0, role(vis, l.role)),
+            );
+        }
+        markmaid::Item::Text(t) => {
+            let color = role(vis, t.role);
+            let font = if t.mono {
+                FontId::monospace(t.size as f32)
+            } else {
+                FontId::proportional(t.size as f32)
+            };
+            let deco = |on: bool| if on { Stroke::new(1.0, color) } else { Stroke::NONE };
+            let mut job = LayoutJob::default();
+            job.append(
+                &t.text,
+                0.0,
+                TextFormat {
+                    font_id: font,
+                    color,
+                    italics: t.em,
+                    underline: deco(t.underline),
+                    strikethrough: deco(t.strike),
+                    ..Default::default()
+                },
+            );
+            // markmaid y = puncak line box → jangkar kiri-atas.
+            ui.painter().galley(at(t.x, t.y), ui.painter().layout_job(job), color);
+        }
+        markmaid::Item::Image(im) => {
+            // Engine tak mendekode piksel: gambar jadi kotak
+            // placeholder berbingkai dengan teks alt di tengah.
+            let rect = Rect::from_min_size(at(im.x, im.y), Vec2::new(im.w as f32, im.h as f32));
+            ui.painter().rect(
+                rect,
+                4.0,
+                role(vis, ColorRole::CodeBg),
+                Stroke::new(1.0, role(vis, ColorRole::Border)),
+            );
+            let label = if im.alt.is_empty() {
+                "▢ gambar".to_string()
+            } else {
+                format!("▢ {}", im.alt)
+            };
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                label,
+                FontId::proportional(12.0),
+                role(vis, ColorRole::Muted),
+            );
+        }
+        markmaid::Item::Diagram(d) => {
+            let sc = d.scale;
+            let ts = |ex: f64, ey: f64| {
+                origin + Vec2::new((d.x + ex * sc) as f32, (d.y + ey * sc) as f32)
+            };
+            paint_embedded(ui.painter(), &d.view, blank, &ts, sc as f32);
+            // Diagram bisa diklik → buka blok sumbernya sebagai tab.
+            let drect = Rect::from_min_size(
+                at(d.x, d.y),
+                Vec2::new((d.size.0 * sc) as f32, (d.size.1 * sc) as f32),
+            );
+            let resp = ui
+                .interact(
+                    drect,
+                    egui::Id::new(("mmd-diagram", *diagram_ord)),
+                    Sense::click(),
+                )
+                .on_hover_text("klik untuk sunting blok ini sebagai tab");
+            if resp.hovered() {
+                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+            }
+            if resp.clicked() && *diagram_ord < view.block_srcs.len() {
+                *open_req = Some(*diagram_ord);
+            }
+            *diagram_ord += 1;
+        }
+    }
+}
+
+/// Lukis satu tabel yang melebihi lebar kolom dalam ScrollArea horizontal.
+#[allow(clippy::too_many_arguments)]
+fn paint_markmaid_table(
+    ui: &mut egui::Ui,
+    view: &MdView,
+    tz: &markmaid::TableZone,
+    origin: Pos2,
+    vis: &egui::Visuals,
+    blank: &Scene,
+    open_req: &mut Option<usize>,
+    diagram_ord: &mut usize,
+) {
+    let table_min = origin + Vec2::new(tz.x as f32, tz.y as f32);
+    let table_rect = Rect::from_min_size(table_min, Vec2::new(tz.w as f32, tz.h as f32));
+    ui.allocate_new_ui(
+        egui::UiBuilder::new().max_rect(table_rect),
+        |ui| {
+            egui::Frame::none().show(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt(("mmd-table-scroll", tz.items.start))
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        ui.set_min_width(tz.natural_w as f32);
+                        ui.set_min_height(tz.h as f32);
+                        let table_origin = ui.min_rect().min;
+                        let doc_origin = table_origin - Vec2::new(tz.x as f32, tz.y as f32);
+                        for item in &view.scene.items[tz.items.clone()] {
+                            paint_markmaid_item(
+                                ui,
+                                view,
+                                item,
+                                doc_origin,
+                                vis,
+                                blank,
+                                open_req,
+                                diagram_ord,
+                            );
+                        }
+                        // Tautan di dalam sel tabel — hit-test dengan scroll.
+                        for (i, lz) in view.scene.links.iter().enumerate() {
+                            if link_in_zone(lz, tz) {
+                                let rect = Rect::from_min_size(
+                                    doc_origin + Vec2::new(lz.x as f32, lz.y as f32),
+                                    Vec2::new(lz.w as f32, lz.h as f32),
+                                );
+                                let resp = ui.interact(
+                                    rect,
+                                    egui::Id::new(("mmd-link-tbl", i)),
+                                    Sense::click(),
+                                );
+                                if resp.hovered() {
+                                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                                }
+                                if resp.clicked() {
+                                    ui.ctx().open_url(egui::OpenUrl::new_tab(lz.url.clone()));
+                                }
+                            }
+                        }
+                    });
+            });
+        },
+    );
+}
+
+/// Lukis satu `DocScene` markmaid ke `ui`, berpangkal di `origin`
 /// (skala 1:1 — layout sudah dihitung pada lebar panel). Diagram bisa
 /// diklik untuk dibuka sebagai tab (lewat `open_req`); tautan yang
-/// diklik dibuka di browser.
+/// diklik dibuka di browser. Tabel yang melebihi lebar kolom di-render
+/// dalam ScrollArea horizontal tersendiri.
 fn paint_docscene(
     ui: &mut egui::Ui,
-    painter: &egui::Painter,
     view: &MdView,
     origin: Pos2,
     open_req: &mut Option<usize>,
 ) {
-    use egui::text::{LayoutJob, TextFormat};
-    use markmaid::{ColorRole, Item};
-
-    let at = |x: f64, y: f64| origin + Vec2::new(x as f32, y as f32);
     // Snapshot tema (owned) supaya pemetaan warna tak menahan pinjaman
     // `ui` saat nanti memanggil `ui.interact`/`ui.output_mut`.
     let vis = ui.visuals().clone();
@@ -2608,100 +2783,37 @@ fn paint_docscene(
     // tapi node/edge-nya kosong — geometrinya ada di pie/seq sendiri.
     let blank = blank_scene(0.0, 0.0);
     let mut diagram_ord = 0usize;
-
-    for item in &view.scene.items {
-        match item {
-            Item::Rect(r) => {
-                let rect = Rect::from_min_size(at(r.x, r.y), Vec2::new(r.w as f32, r.h as f32));
-                let fill = r.fill.map_or(Color32::TRANSPARENT, |f| role(&vis, f));
-                let stroke = r.stroke.map_or(Stroke::NONE, |s| Stroke::new(1.0, role(&vis, s)));
-                painter.rect(rect, r.rounding as f32, fill, stroke);
-            }
-            Item::Line(l) => {
-                painter.line_segment(
-                    [at(l.x1, l.y1), at(l.x2, l.y2)],
-                    Stroke::new(1.0, role(&vis, l.role)),
-                );
-            }
-            Item::Text(t) => {
-                let color = role(&vis, t.role);
-                let font = if t.mono {
-                    FontId::monospace(t.size as f32)
-                } else {
-                    FontId::proportional(t.size as f32)
-                };
-                let deco = |on: bool| if on { Stroke::new(1.0, color) } else { Stroke::NONE };
-                let mut job = LayoutJob::default();
-                job.append(
-                    &t.text,
-                    0.0,
-                    TextFormat {
-                        font_id: font,
-                        color,
-                        italics: t.em,
-                        underline: deco(t.underline),
-                        strikethrough: deco(t.strike),
-                        ..Default::default()
-                    },
-                );
-                // markmaid y = puncak line box → jangkar kiri-atas.
-                painter.galley(at(t.x, t.y), painter.layout_job(job), color);
-            }
-            Item::Image(im) => {
-                // Engine tak mendekode piksel: gambar jadi kotak
-                // placeholder berbingkai dengan teks alt di tengah.
-                let rect = Rect::from_min_size(at(im.x, im.y), Vec2::new(im.w as f32, im.h as f32));
-                painter.rect(
-                    rect,
-                    4.0,
-                    role(&vis, ColorRole::CodeBg),
-                    Stroke::new(1.0, role(&vis, ColorRole::Border)),
-                );
-                let label = if im.alt.is_empty() {
-                    "▢ gambar".to_string()
-                } else {
-                    format!("▢ {}", im.alt)
-                };
-                painter.text(
-                    rect.center(),
-                    Align2::CENTER_CENTER,
-                    label,
-                    FontId::proportional(12.0),
-                    role(&vis, ColorRole::Muted),
-                );
-            }
-            Item::Diagram(d) => {
-                let sc = d.scale;
-                let ts = |ex: f64, ey: f64| {
-                    origin + Vec2::new((d.x + ex * sc) as f32, (d.y + ey * sc) as f32)
-                };
-                paint_embedded(painter, &d.view, &blank, &ts, sc as f32);
-                // Diagram bisa diklik → buka blok sumbernya sebagai tab.
-                let drect = Rect::from_min_size(
-                    at(d.x, d.y),
-                    Vec2::new((d.size.0 * sc) as f32, (d.size.1 * sc) as f32),
-                );
-                let resp = ui
-                    .interact(
-                        drect,
-                        egui::Id::new(("mmd-diagram", diagram_ord)),
-                        Sense::click(),
-                    )
-                    .on_hover_text("klik untuk sunting blok ini sebagai tab");
-                if resp.hovered() {
-                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
-                }
-                if resp.clicked() && diagram_ord < view.block_srcs.len() {
-                    *open_req = Some(diagram_ord);
-                }
-                diagram_ord += 1;
-            }
+    let mut table_idx = 0usize;
+    let mut i = 0;
+    while i < view.scene.items.len() {
+        if let Some(tz) = view.scene.tables.get(table_idx).filter(|tz| tz.items.start == i) {
+            paint_markmaid_table(ui, view, tz, origin, &vis, &blank, open_req, &mut diagram_ord);
+            i = tz.items.end;
+            table_idx += 1;
+            continue;
         }
+        paint_markmaid_item(
+            ui,
+            view,
+            &view.scene.items[i],
+            origin,
+            &vis,
+            &blank,
+            open_req,
+            &mut diagram_ord,
+        );
+        i += 1;
     }
 
-    // Tautan: zona hit-test dari markmaid → klik membuka URL di browser.
+    // Tautan di luar tabel: zona hit-test dari markmaid → klik membuka URL di browser.
     for (i, lz) in view.scene.links.iter().enumerate() {
-        let rect = Rect::from_min_size(at(lz.x, lz.y), Vec2::new(lz.w as f32, lz.h as f32));
+        if view.scene.tables.iter().any(|tz| link_in_zone(lz, tz)) {
+            continue;
+        }
+        let rect = Rect::from_min_size(
+            origin + Vec2::new(lz.x as f32, lz.y as f32),
+            Vec2::new(lz.w as f32, lz.h as f32),
+        );
         let resp = ui.interact(rect, egui::Id::new(("mmd-link", i)), Sense::click());
         if resp.hovered() {
             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
