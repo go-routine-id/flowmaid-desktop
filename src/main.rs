@@ -1331,12 +1331,12 @@ impl App {
                     let gx = rect.left() + 4.0 + l as f32 * INDENT + 5.0;
                     p.line_segment(
                         [Pos2::new(gx, rect.top()), Pos2::new(gx, rect.bottom())],
-                        Stroke::new(1.0, guide),
+                        Stroke::new(1.0_f32, guide),
                     );
                 }
                 let muted = v.weak_text_color();
                 if t.is_dir {
-                    chevron(p, Pos2::new(x0 + 5.0, cy), open, Stroke::new(1.5, muted));
+                    chevron(p, Pos2::new(x0 + 5.0, cy), open, Stroke::new(1.5_f32, muted));
                     // Ikon folder: tab kecil + badan.
                     let fx = x0 + 13.0;
                     let fill = muted.gamma_multiply(0.8);
@@ -1369,9 +1369,9 @@ impl App {
                     p.rect_stroke(
                         Rect::from_min_size(Pos2::new(fx, cy - 5.5), Vec2::new(9.0, 11.0)),
                         1.0,
-                        Stroke::new(1.2, tint),
+                        Stroke::new(1.2_f32, tint),
                     );
-                    let ink = Stroke::new(1.0, tint.gamma_multiply(0.7));
+                    let ink = Stroke::new(1.0_f32, tint.gamma_multiply(0.7));
                     for (dy, len) in [(-1.5, 5.0), (1.0, 5.0), (3.5, 3.0)] {
                         p.line_segment(
                             [Pos2::new(fx + 2.0, cy + dy), Pos2::new(fx + 2.0 + len, cy + dy)],
@@ -1704,7 +1704,7 @@ impl eframe::App for App {
                                     ui.painter(),
                                     Pos2::new(rect.left() + 7.0, rect.center().y),
                                     self.tree_root_open,
-                                    Stroke::new(1.5, v.weak_text_color()),
+                                    Stroke::new(1.5_f32, v.weak_text_color()),
                                 );
                                 let galley = ellipsized(
                                     ui,
@@ -2005,11 +2005,11 @@ impl App {
         if let Some(ms) = &self.mind {
             let paper = Rect::from_min_max(ts(0.0, 0.0), ts(ms.width, ms.height))
                 .expand(12.0 * zoom);
-            painter.rect(paper, 8.0 * zoom, Color32::WHITE, Stroke::new(1.0, LABEL_BORDER));
+            painter.rect(paper, 8.0 * zoom, Color32::WHITE, Stroke::new(1.0_f32, LABEL_BORDER));
             draw_mindmap(painter, ms, &ts, zoom);
         } else if let Some(jsc) = &self.journey {
             let paper = Rect::from_min_max(ts(0.0, 0.0), ts(jsc.width, jsc.height));
-            painter.rect(paper, 8.0 * zoom, Color32::WHITE, Stroke::new(1.0, LABEL_BORDER));
+            painter.rect(paper, 8.0 * zoom, Color32::WHITE, Stroke::new(1.0_f32, LABEL_BORDER));
             draw_journey(painter, jsc, &ts, zoom);
         } else {
             let refs = DiagramRefs {
@@ -2109,7 +2109,7 @@ fn paint_diagram(
             9.0 * zoom,
             Color32::from_black_alpha(70),
         );
-        painter.rect(paper, 8.0 * zoom, Color32::WHITE, Stroke::new(1.0, LABEL_BORDER));
+        painter.rect(paper, 8.0 * zoom, Color32::WHITE, Stroke::new(1.0_f32, LABEL_BORDER));
     }
 
     for c in &d.scn.clusters {
@@ -2616,13 +2616,13 @@ fn paint_markmaid_item(
         markmaid::Item::Rect(r) => {
             let rect = Rect::from_min_size(at(r.x, r.y), Vec2::new(r.w as f32, r.h as f32));
             let fill = r.fill.map_or(Color32::TRANSPARENT, |f| role(vis, f));
-            let stroke = r.stroke.map_or(Stroke::NONE, |s| Stroke::new(1.0, role(vis, s)));
+            let stroke = r.stroke.map_or(Stroke::NONE, |s| Stroke::new(1.0_f32, role(vis, s)));
             ui.painter().rect(rect, r.rounding as f32, fill, stroke);
         }
         markmaid::Item::Line(l) => {
             ui.painter().line_segment(
                 [at(l.x1, l.y1), at(l.x2, l.y2)],
-                Stroke::new(1.0, role(vis, l.role)),
+                Stroke::new(1.0_f32, role(vis, l.role)),
             );
         }
         markmaid::Item::Text(t) => {
@@ -2632,7 +2632,7 @@ fn paint_markmaid_item(
             } else {
                 FontId::proportional(t.size as f32)
             };
-            let deco = |on: bool| if on { Stroke::new(1.0, color) } else { Stroke::NONE };
+            let deco = |on: bool| if on { Stroke::new(1.0_f32, color) } else { Stroke::NONE };
             let mut job = LayoutJob::default();
             job.append(
                 &t.text,
@@ -2657,7 +2657,7 @@ fn paint_markmaid_item(
                 rect,
                 4.0,
                 role(vis, ColorRole::CodeBg),
-                Stroke::new(1.0, role(vis, ColorRole::Border)),
+                Stroke::new(1.0_f32, role(vis, ColorRole::Border)),
             );
             let label = if im.alt.is_empty() {
                 "▢ gambar".to_string()
