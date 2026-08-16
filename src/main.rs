@@ -2318,6 +2318,7 @@ fn role(v: &egui::Visuals, r: markmaid::ColorRole) -> Color32 {
         R::Muted => v.weak_text_color(),
         R::Link => v.hyperlink_color,
         R::CodeBg => v.code_bg_color,
+        R::CodeHighlightBg => Color32::from_rgb(0xdb, 0xe4, 0xff),
         R::QuoteBg | R::TableStripeBg => v.faint_bg_color,
         R::Border => v.widgets.noninteractive.bg_stroke.color,
         R::ErrorText => v.error_fg_color,
