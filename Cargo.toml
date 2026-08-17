@@ -20,7 +20,7 @@ rfd = "0.17.2"
 # Untuk co-development lokal, override dengan:
 #   [patch."https://github.com/go-routine-id/markmaid"]
 #   markmaid = { path = "../markmaid" }
-markmaid = { git = "https://github.com/go-routine-id/markmaid" }
+markmaid = { git = "https://github.com/go-routine-id/markmaid", features = ["syntax-tree-sitter"] }
 
 # Rampingkan binary release dan bantu inlining lintas-crate.
 [profile.release]

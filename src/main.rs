@@ -2319,6 +2319,14 @@ fn role(v: &egui::Visuals, r: markmaid::ColorRole) -> Color32 {
         R::Link => v.hyperlink_color,
         R::CodeBg => v.code_bg_color,
         R::CodeHighlightBg => Color32::from_rgb(0xdb, 0xe4, 0xff),
+        // Syntax highlighting palette — same semantic slots as markmaid's
+        // default light-paper SVG palette, adapted slightly for egui themes.
+        R::CodeComment => Color32::from_rgb(0x6a, 0x73, 0x7d),
+        R::CodeKeyword => Color32::from_rgb(0xd7, 0x3a, 0x49),
+        R::CodeString => Color32::from_rgb(0x22, 0x86, 0x3a),
+        R::CodeNumber => Color32::from_rgb(0x00, 0x5c, 0xc5),
+        R::CodeType => Color32::from_rgb(0x6f, 0x42, 0xc1),
+        R::CodeFunction => Color32::from_rgb(0x82, 0x50, 0xdf),
         R::QuoteBg | R::TableStripeBg => v.faint_bg_color,
         R::Border => v.widgets.noninteractive.bg_stroke.color,
         R::ErrorText => v.error_fg_color,
